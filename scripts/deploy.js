@@ -1,0 +1,45 @@
+const hre = require("hardhat");
+const { ethers } = hre;
+
+async function main() {
+  const initialOwner = hre.config.initialOwner;
+  const [deployer] = await ethers.getSigners();
+
+  console.log("Deploying contracts with:", deployer.address);
+
+  // Configs
+  const devWallet = deployer.address;
+  const rmcWallet = deployer.address;
+
+  const supportedTokens = [
+    "0x985458E523dB3d53125813eD68c274899e9DfAb4", //USDC
+    "0x3C2B8Be99c50593081EAA2A724F0B8285F5aba8f", //USDT
+    "0x6983D1E6DEf3690C4d616b13597A09e6193EA013", //wETH
+    "0xE176EBE47d621b984a73036B9DA5d834411ef734", //BUSD
+    "0x0aB43550A6915F9f67d0c454C2E90385E6497EaA", //bscBUSD
+    "0x3095c7557bCb296ccc6e363DE01b760bA031F2d9", //wBTC
+    "0xEf977d2f931C1978Db5F6747666fa1eACB0d0339", //DAI
+  ];
+
+  const dailyLimitUsd = ethers.parseUnits("100", 18); // $100 limit
+  const oracleAddress = "0xDA7a001b254CD22e46d3eAB04d937489c93174C3"; 
+
+  const RecoveryVault = await ethers.getContractFactory("RecoveryVault");
+  const vault = await RecoveryVault.deploy(
+    initialOwner,
+    devWallet,
+    rmcWallet,
+    supportedTokens,
+    dailyLimitUsd,
+    oracleAddress
+  );
+
+  await vault.waitForDeployment();
+
+  console.log("RecoveryVault deployed to:", vault.target);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

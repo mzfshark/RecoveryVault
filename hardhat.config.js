@@ -21,7 +21,7 @@ module.exports = {
         runs: 200,
         enabled: true,
         details: {
-          yulDetails: { optimizerSteps: "u", },
+          yulDetails: { optimizerSteps: "u" },
         },
       },
     },
