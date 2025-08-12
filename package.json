@@ -1,0 +1,29 @@
+{
+  "name": "recovery-vault",
+  "version": "1.0.0",
+  "description": "Fixed price redemption vault for depegged tokens on Harmony",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.js --network harmony",
+    "verify": "hardhat verify"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^3.0.0",
+    "@nomicfoundation/hardhat-verify": "^1.0.0",
+    "@openzeppelin/contracts": "^4.9.3",
+    "chai": "^4.3.7",
+    "dotenv": "^16.3.1",
+    "ethers": "^6.13.0",
+    "hardhat": "^2.22.3",
+    "mocha": "^10.2.0",
+    "typechain": "^8.3.1",
+    "@typechain/ethers-v6": "^4.0.3",
+    "@types/node": "^20.11.30",
+    "typescript": "^5.4.5"
+  }
+}
