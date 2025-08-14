@@ -19,7 +19,7 @@ contract RecoveryVault is Ownable {
     uint256 public constant WALLET_RESET_INTERVAL = 24 hours;
 
     address public immutable wONE;
-    address public immutable usdc;
+    address public immutable peggedUSDC;
     address public devWallet;
     address public rmcWallet;
     bytes32 public merkleRoot;
@@ -31,7 +31,7 @@ contract RecoveryVault is Ownable {
 
     IOracle public oracle;
 
-    mapping(address => bool) public supportedToken;
+    mapping(address => bool) public supportedToken; // these are the depegged tokens
     mapping(uint256 => mapping(address => uint256)) public redeemedInRound;
     mapping(address => uint256) public lastRedeemTimestamp;
 
@@ -52,7 +52,7 @@ contract RecoveryVault is Ownable {
         address _devWallet,
         address _rmcWallet,
         address _wone,
-        address _usdc,
+        address _peggedUSDC,
         address[] memory _supportedTokens,
         uint256 _dailyLimitUsd,
         address _oracle
@@ -61,7 +61,7 @@ contract RecoveryVault is Ownable {
         devWallet = _devWallet;
         rmcWallet = _rmcWallet;
         wONE = _wone;
-        usdc = _usdc;
+        peggedUSDC = _peggedUSDC;
         dailyLimitUsd = _dailyLimitUsd;
         oracle = IOracle(_oracle);
 
@@ -92,7 +92,7 @@ contract RecoveryVault is Ownable {
     }
 
     function withdrawFunds(address token) external onlyOwner {
-        require(token == wONE || token == usdc, "Token not allowed");
+        require(token == wONE || token == peggedUSDC, "Token not allowed");
         uint256 balance = IERC20(token).balanceOf(address(this));
         require(balance > 0, "Nothing to withdraw");
         require(IERC20(token).transfer(rmcWallet, balance), "Withdraw failed");
@@ -101,7 +101,7 @@ contract RecoveryVault is Ownable {
     function startNewRound(uint256 _roundId) external onlyOwner {
         require(_roundId > currentRound, "Round ID must increase");
         uint256 woneBalance = IERC20(wONE).balanceOf(address(this));
-        uint256 usdcBalance = IERC20(usdc).balanceOf(address(this));
+        uint256 usdcBalance = IERC20(peggedUSDC).balanceOf(address(this));
         require(woneBalance > 0 || usdcBalance > 0, "No funds");
         currentRound = _roundId;
         roundFunds = woneBalance + usdcBalance;
@@ -116,8 +116,8 @@ contract RecoveryVault is Ownable {
         bytes32[] calldata proof
     ) external roundActive onlyWhitelisted(proof) {
         require(supportedToken[tokenIn], "Token not supported");
-        require(tokenIn == wONE || tokenIn == usdc, "Only wONE or USDC allowed");
-        require(redeemIn == wONE || redeemIn == usdc, "Must redeem in supported token");
+        require(tokenIn != wONE && tokenIn != peggedUSDC, "Cannot redeem with pegged token");
+        require(redeemIn == wONE || redeemIn == peggedUSDC, "Must redeem in supported token");
         require(amountIn > 0, "Invalid amount");
 
         _resetIfNeeded(msg.sender);
