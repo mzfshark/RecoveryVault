@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.18;
 
-import {Ownable} from "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/refs/tags/v4.9.3/contracts/access/Ownable.sol";
-import {IERC20} from "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/refs/tags/v4.9.3/contracts/token/ERC20/IERC20.sol";
-import {MerkleProof} from "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/refs/tags/v4.9.3/contracts/utils/cryptography/MerkleProof.sol";
+import {Ownable} from "./hub/access/Ownable.sol"; 
+import {IERC20} from "./hub/token/ERC20/IERC20.sol";
+import {MerkleProof} from "./hub/utils/cryptography/MerkleProof.sol";
 
 interface IOracle {
     function getPrice() external view returns (uint256);
@@ -107,10 +107,10 @@ contract RecoveryVault is Ownable {
         address tokenIn,
         uint256 amountIn,
         bytes32[] calldata proof
-    ) external roundActive onlyWhitelisted(proof) {
+    ) external roundActive {
+        require(_verifyWhitelist(msg.sender, proof), "Not whitelisted");
         require(supportedToken[tokenIn], "Token not supported");
         require(amountIn > 0, "Invalid amount");
-        require(IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn), "Transfer failed");
 
         _resetIfNeeded(msg.sender);
 
@@ -118,6 +118,8 @@ contract RecoveryVault is Ownable {
         uint256 maxAmount = (dailyLimitUsd * 1e18) / usdToOneRate;
 
         require(redeemedInRound[currentRound][msg.sender] + amountIn <= maxAmount, "Exceeds daily limit");
+
+        require(IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn), "Transfer failed");
 
         uint256 fee = _calculateFee(amountIn, usdToOneRate);
         uint256 refundAmount = amountIn - fee;

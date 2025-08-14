@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.18;
 
-import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/refs/tags/v4.9.3/contracts/token/ERC20/ERC20.sol";
+import "../hub/token/ERC20/ERC20.sol";
 
 contract ERC20Mock is ERC20 {
     constructor(string memory name, string memory symbol, uint8 decimals_) ERC20(name, symbol) {

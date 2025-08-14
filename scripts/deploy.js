@@ -9,7 +9,7 @@ async function main() {
 
   // Configs
   const devWallet = deployer.address;
-  const rmcWallet = deployer.address;
+  const rmcWallet = "0xD8194284df879f465ed61DBA6fa8300940cacEA3";
 
   const supportedTokens = [
     "0x985458E523dB3d53125813eD68c274899e9DfAb4", //USDC
