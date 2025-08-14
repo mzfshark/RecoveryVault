@@ -2,14 +2,14 @@ const hre = require("hardhat");
 const { ethers } = hre;
 
 async function main() {
-  const initialOwner = hre.config.initialOwner;
+  const initialOwner = process.env.INITIAL_OWNER;
   const [deployer] = await ethers.getSigners();
 
   console.log("Deploying contracts with:", deployer.address);
 
   // Configuration
-  const devWallet = deployer.address;
-  const rmcWallet = "0xD8194284df879f465ed61DBA6fa8300940cacEA3";
+  const devWallet = process.env.DEV_WALLET;
+  const rmcWallet = process.env.RMC_WALLET_ADDRESS;
 
   // Supported depegged tokens
   const supportedTokens = [
@@ -23,7 +23,7 @@ async function main() {
   ];
 
   const dailyLimitUsd = ethers.parseUnits("100", 18); // $100 limit per day
-  const oracleAddress = "0xDA7a001b254CD22e46d3eAB04d937489c93174C3"; // Band oracle
+  const oracleAddress = process.env.HARMONY_ORACLE; // Band oracle
 
   const wONE = "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a";
   const peggedUSDC = "0xBC594CABd205bD993e7FfA6F3e9ceA75c1110da5";

@@ -63,7 +63,8 @@ describe("RecoveryVault", function () {
       rmc,
       oracle,
       root,
-      tree
+      tree,
+      ethers
     };
   }
 
@@ -78,7 +79,7 @@ describe("RecoveryVault", function () {
   });
 
   it("should allow redeem if whitelisted with correct proof", async function () {
-    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle } = await loadFixture(deployFixture);
+    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle, ethers } = await loadFixture(deployFixture);
     const proof = tree.getHexProof(keccak256(user1.address));
 
     await time.increase(86401);
@@ -87,8 +88,8 @@ describe("RecoveryVault", function () {
 
     const dailyLimit = await vault.dailyLimitUsd();
     const oracleRate = await oracle.getPrice();
-    const maxAmount = dailyLimit.mul(ethers.parseUnits("1", 18)).div(oracleRate);
-    const amount = maxAmount.sub(ethers.parseUnits("1", 18));
+    const maxAmount = dailyLimit * BigInt(1e18) / oracleRate;
+    const amount = maxAmount - BigInt(1e18);
 
     await expect(
       vault.connect(user1).redeem(depeggedUSDC.target, amount, peggedUSDC.target, proof)
@@ -96,7 +97,7 @@ describe("RecoveryVault", function () {
   });
 
   it("should enforce daily limit per wallet", async function () {
-    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle } = await loadFixture(deployFixture);
+    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle, ethers } = await loadFixture(deployFixture);
     const proof = tree.getHexProof(keccak256(user1.address));
 
     await time.increase(86401);
@@ -105,8 +106,8 @@ describe("RecoveryVault", function () {
 
     const dailyLimit = await vault.dailyLimitUsd();
     const oracleRate = await oracle.getPrice();
-    const maxAmount = dailyLimit.mul(ethers.parseUnits("1", 18)).div(oracleRate);
-    const exceed = maxAmount.add(ethers.parseUnits("1", 18));
+    const maxAmount = dailyLimit * BigInt(1e18) / oracleRate;
+    const exceed = maxAmount + BigInt(1e18);
 
     await expect(
       vault.connect(user1).redeem(depeggedUSDC.target, exceed, peggedUSDC.target, proof)
@@ -114,7 +115,7 @@ describe("RecoveryVault", function () {
   });
 
   it("should reset limit after 24h", async function () {
-    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle } = await loadFixture(deployFixture);
+    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle, ethers } = await loadFixture(deployFixture);
     const proof = tree.getHexProof(keccak256(user1.address));
 
     await time.increase(86401);
@@ -123,7 +124,7 @@ describe("RecoveryVault", function () {
 
     const dailyLimit = await vault.dailyLimitUsd();
     const oracleRate = await oracle.getPrice();
-    const halfAmount = dailyLimit.mul(ethers.parseUnits("1", 18)).div(oracleRate).div(2);
+    const halfAmount = (dailyLimit * BigInt(1e18) / oracleRate) / BigInt(2);
 
     await vault.connect(user1).redeem(depeggedUSDC.target, halfAmount, peggedUSDC.target, proof);
     await time.increase(86401);
@@ -131,15 +132,19 @@ describe("RecoveryVault", function () {
   });
 
   it("should apply correct fee tier", async function () {
-    const { vault, depeggedUSDC, peggedUSDC, user1, tree } = await loadFixture(deployFixture);
+    const { vault, depeggedUSDC, peggedUSDC, user1, tree, oracle, ethers } = await loadFixture(deployFixture);
     const proof = tree.getHexProof(keccak256(user1.address));
 
     await time.increase(86401);
     await vault.startNewRound(4);
     await time.increase(86401);
 
+    const dailyLimit = await vault.dailyLimitUsd();
+    const oracleRate = await oracle.getPrice();
+    const amount = (dailyLimit * BigInt(1e18) / oracleRate) - BigInt(1);
+
     await expect(
-      vault.connect(user1).redeem(depeggedUSDC.target, ethers.parseUnits("10", 18), peggedUSDC.target, proof)
+      vault.connect(user1).redeem(depeggedUSDC.target, amount, peggedUSDC.target, proof)
     ).to.emit(vault, "BurnToken");
   });
 
