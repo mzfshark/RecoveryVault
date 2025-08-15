@@ -1,35 +1,59 @@
-const hre = require("hardhat");
-const { ethers } = hre;
+#!/usr/bin/env node
+// scripts/deploy.js
+const { ethers, run } = require('hardhat');
+const config = require('./config.json');
 
 async function main() {
-  const initialOwner = process.env.INITIAL_OWNER;
   const [deployer] = await ethers.getSigners();
+  if (!deployer) {
+    console.error('❌ No deployer account found. Check network configuration.');
+    process.exit(1);
+  }
+  const initialOwner = await deployer.getAddress();
+  const devWallet = initialOwner;
+  const rmcWallet = config.RECOVERY?.rmcWallet;
+  const wONE = config.RECOVERY?.wONE;
+  const peggedUSDC = config.RECOVERY?.peggedUSDC;
+  const oracleAddress = config.RECOVERY?.oracle;
+  const dailyLimitUsd = ethers.parseUnits(config.RECOVERY?.dailyLimitUsd || "100", 18);
 
-  console.log("Deploying contracts with:", deployer.address);
+  const rawTokens = config.RECOVERY?.supportedTokens || [];
+  const supportedTokens = [...new Set(
+    rawTokens.filter((addr) => {
+      if (!addr) return false;
+      const valid = ethers.isAddress(addr);
+      if (!valid) console.warn(`⚠️ Invalid token skipped: ${addr}`);
+      return valid;
+    })
+  )];
+  if (!supportedTokens.length) {
+    console.error('❌ No valid supported token addresses found. Aborting.');
+    process.exit(1);
+  }
 
-  // Configuration
-  const devWallet = process.env.DEV_WALLET;
-  const rmcWallet = process.env.RMC_WALLET_ADDRESS;
+  const Factory = await ethers.getContractFactory('RecoveryVault');
 
-  // Supported depegged tokens
-  const supportedTokens = [
-    "0x985458E523dB3d53125813eD68c274899e9DfAb4", // aUSDC
-    "0x3C2B8Be99c50593081EAA2A724F0B8285F5aba8f", // aUSDT
-    "0x6983D1E6DEf3690C4d616b13597A09e6193EA013", // aWETH
-    "0xE176EBE47d621b984a73036B9DA5d834411ef734", // aBUSD
-    "0x0aB43550A6915F9f67d0c454C2E90385E6497EaA", // bscBUSD
-    "0x3095c7557bCb296ccc6e363DE01b760bA031F2d9", // aWBTC
-    "0xEf977d2f931C1978Db5F6747666fa1eACB0d0339", // aDAI
-  ];
+  let gasLimit;
+  try {
+    console.log("🚀 Deploying RecoveryVault with owner:", initialOwner);
+    const deployTx = Factory.getDeployTransaction(
+      initialOwner,
+      devWallet,
+      rmcWallet,
+      wONE,
+      peggedUSDC,
+      supportedTokens,
+      dailyLimitUsd,
+      oracleAddress
+    );
+    const estimated = await deployer.estimateGas(deployTx);
+    gasLimit = (estimated * 120n) / 100n; // 20% buffer
+  } catch (err) {
+    console.warn('⚠️ estimateGas failed or not supported, using fallback 5,000,000');
+    gasLimit = 5000000n;
+  }
 
-  const dailyLimitUsd = ethers.parseUnits("100", 18); // $100 limit per day
-  const oracleAddress = process.env.HARMONY_ORACLE; // Band oracle
-
-  const wONE = "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a";
-  const peggedUSDC = "0xBC594CABd205bD993e7FfA6F3e9ceA75c1110da5";
-
-  const RecoveryVault = await ethers.getContractFactory("RecoveryVault");
-  const vault = await RecoveryVault.deploy(
+  const vault = await Factory.deploy(
     initialOwner,
     devWallet,
     rmcWallet,
@@ -37,15 +61,40 @@ async function main() {
     peggedUSDC,
     supportedTokens,
     dailyLimitUsd,
-    oracleAddress
+    oracleAddress,
+    { gasLimit }
   );
-
   await vault.waitForDeployment();
 
-  console.log("RecoveryVault deployed to:", vault.target);
+  const address = await vault.getAddress();
+  const network = await ethers.provider.getNetwork();
+  console.log(`✅ Deployed RecoveryVault at ${address} on ${network.name} (chainId ${network.chainId})`);
+
+  const confirmations = network.chainId === 1 ? 6 : 1;
+  await (await vault.deploymentTransaction()).wait(confirmations);
+
+  try {
+    await run('verify:verify', {
+      address,
+      constructorArguments: [
+        initialOwner,
+        devWallet,
+        rmcWallet,
+        wONE,
+        peggedUSDC,
+        supportedTokens,
+        dailyLimitUsd,
+        oracleAddress
+      ],
+      contract: 'contracts/RecoveryVault.sol:RecoveryVault'
+    });
+    console.log('✅ Verification complete!');
+  } catch (err) {
+    console.warn('⚠️ Verification failed or skipped:', err.message);
+  }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
 });
