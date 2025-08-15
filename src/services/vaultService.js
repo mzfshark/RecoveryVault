@@ -1,6 +1,6 @@
 // vaultService.js
 import { ethers } from 'ethers';
-import RecoveryVaultABI from '../../contracts/abis/RecoveryVault.abi.json';
+import RecoveryVaultABI from '../../contracts/abis/RecoveryVaultABI.json';
 
 const VAULT_ADDRESS = import.meta.env.VAULT_ADDRESS;
 

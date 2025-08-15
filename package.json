@@ -9,7 +9,8 @@
     "deploy": "hardhat run scripts/deploy.js --network harmony",
     "verify": "hardhat verify",
     "merkle": "node scripts/generateMerkle.js",
-    "setmerkleproof": "npx hardhat run scripts/setMerkleProof.js --network harmony"
+    "setmerkleproof": "npx hardhat run scripts/setMerkleProof.js --network harmony",
+    "vaultservice": "npx vitest run"
   },
   "keywords": [
     "Recovery Harmony"
@@ -27,7 +28,9 @@
     "keccak256": "^1.0.6",
     "merkletreejs": "0.5.2",
     "solidity-coverage": "0.8.16",
-    "ts-node": "10.9.2"
+    "ts-node": "10.9.2",
+    "vite": "^7.1.2",
+    "vitest": "3.2.4"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^3.0.0",
