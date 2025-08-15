@@ -1,8 +1,10 @@
 // test/vaultService.test.js
 import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { ethers } from 'ethers';
-import * as vaultService from '../src/services/vaultService.js';
 
+// Ensure a valid contract address is present for the service under test
+vi.stubEnv('VAULT_ADDRESS', '0x000000000000000000000000000000000000dEaD');
+
+// --- Mocks shared across tests ---
 const mockProvider = {
   getSigner: vi.fn(),
 };
@@ -16,44 +18,62 @@ const mockContract = {
   isLocked: vi.fn(),
 };
 
-vi.mock('ethers', async () => {
-  const original = await vi.importActual('ethers');
-  return {
-    ...original,
-    Contract: vi.fn(() => mockContract),
-  };
-});
+// Mock the 'ethers' module to provide named exports used by the service
+vi.mock('ethers', () => ({
+  Contract: vi.fn(() => mockContract),
+  isAddress: vi.fn(() => true),
+}));
+
+// Import after mocks and env stubbing
+import * as vaultService from '../src/services/vaultService';
 
 describe('vaultService', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // In ethers v6, BrowserProvider.getSigner() is async
+    mockProvider.getSigner.mockResolvedValue({});
   });
 
   it('calls redeem with correct args', async () => {
-    const mockTx = { wait: vi.fn(), hash: '0x123' };
+    const mockTx = {
+      wait: vi.fn().mockResolvedValue({ hash: '0x123' }),
+      hash: '0x123',
+    };
     mockContract.redeem.mockResolvedValue(mockTx);
-    const result = await vaultService.redeem(mockProvider, '0xToken', '1000000000000000000', ['0xProof']);
+
+    const result = await vaultService.redeem(
+      mockProvider,
+      '0xToken',
+      '1000000000000000000',
+      ['0xProof']
+    );
+
     expect(result).toBe('0x123');
-    expect(mockContract.redeem).toHaveBeenCalledWith('0xToken', '1000000000000000000', ['0xProof']);
+    expect(mockContract.redeem).toHaveBeenCalledWith(
+      '0xToken',
+      '1000000000000000000',
+      ['0xProof']
+    );
+    expect(mockTx.wait).toHaveBeenCalled();
   });
 
   it('getUserLimit returns correct limit', async () => {
-    mockContract.getRemainingLimit.mockResolvedValue(ethers.BigNumber.from('500000000000000000'));
+    mockContract.getRemainingLimit.mockResolvedValue(500000000000000000n);
     const result = await vaultService.getUserLimit(mockProvider, '0xWallet');
     expect(result).toBe('500000000000000000');
   });
 
   it('getFee returns correct value', async () => {
-    mockContract.calculateFee.mockResolvedValue(ethers.BigNumber.from('10000000000000000'));
+    mockContract.calculateFee.mockResolvedValue(10000000000000000n);
     const result = await vaultService.getFee(mockProvider, '0xToken', '1000000000000000000');
     expect(result).toBe('10000000000000000');
   });
 
   it('getRoundStatus returns correct structure', async () => {
-    mockContract.getCurrentRoundId.mockResolvedValue(ethers.BigNumber.from(3));
+    mockContract.getCurrentRoundId.mockResolvedValue(3n);
     mockContract.getRoundInfo.mockResolvedValue({
-      totalAvailable: ethers.BigNumber.from('1000000000000000000'),
-      totalRedeemed: ethers.BigNumber.from('200000000000000000'),
+      totalAvailable: 1000000000000000000n,
+      totalRedeemed: 200000000000000000n,
     });
     const result = await vaultService.getRoundStatus(mockProvider);
     expect(result).toEqual({
