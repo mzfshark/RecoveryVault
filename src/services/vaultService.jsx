@@ -2,9 +2,9 @@
 // All logs and layout texts MUST be in English (per team guidelines)
 
 import { Contract, isAddress } from 'ethers';
-import RecoveryVaultABI from '../../contracts/abis/RecoveryVaultABI.json';
+import RecoveryVaultABI from '../../contracts/abis/RecoveryVaultABI';
 
-const VAULT_ADDRESS = import.meta.env.VAULT_ADDRESS;
+const VAULT_ADDRESS = process.env.VITE_VAULT_ADDRESS;
 
 /**
  * Resolve a signer/runner from a provider (supports ethers v6 BrowserProvider)

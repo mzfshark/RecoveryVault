@@ -1,8 +1,10 @@
-// test/vaultService.test.js
+// test/vaultService.unit.test.jsx
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 
-// Ensure a valid contract address is present for the service under test
-vi.stubEnv('VAULT_ADDRESS', '0x000000000000000000000000000000000000dEaD');
+// Ensure a valid contract address is present for the service under test (align with latest test conventions)
+vi.stubEnv('VITE_VAULT_ADDRESS', '0x000000000000000000000000000000000000dEaD');
+// Backward-compat for service that may still read VITE_RECOVERY_VAULT_ADDRESS
+vi.stubEnv('VITE_RECOVERY_VAULT_ADDRESS', '0x000000000000000000000000000000000000dEaD');
 
 // --- Mocks shared across tests ---
 const mockProvider = {
@@ -25,9 +27,9 @@ vi.mock('ethers', () => ({
 }));
 
 // Import after mocks and env stubbing
-import * as vaultService from '../src/services/vaultService';
+import * as vaultService from '../../src/services/vaultService';
 
-describe('vaultService', () => {
+describe('vaultService (unit)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // In ethers v6, BrowserProvider.getSigner() is async

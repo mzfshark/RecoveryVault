@@ -5,12 +5,14 @@
   "main": "index.js",
   "scripts": {
     "compile": "hardhat compile",
-    "test": "hardhat test",
+    "test:unit": "vitest run --dir test/unit",
+    "test:watch": "vitest --dir test/unit",
+    "test:integration": "hardhat test test/integration/Integration.test.js test/integration/RecoveryVault.test.js",
+    "test": "yarn test:unit && yarn test:integration",
     "deploy": "hardhat run scripts/deploy.js --network harmony",
     "verify": "hardhat verify --network harmony",
     "merkle": "node scripts/generateMerkle.js",
-    "setmerkleproof": "npx hardhat run scripts/setMerkleProof.js --network harmony",
-    "vitest": "npx vitest run"
+    "setmerkleproof": "npx hardhat run scripts/setMerkleProof.js --network harmony"
   },
   "keywords": [
     "Recovery Harmony"
