@@ -2,5 +2,5 @@
 artifacts
 .deps
 node_modules
-.env.local
+.env.*
 cache
