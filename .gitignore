@@ -3,3 +3,4 @@ artifacts
 .deps
 node_modules
 .env.local
+cache
