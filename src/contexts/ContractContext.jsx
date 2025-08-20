@@ -1,8 +1,19 @@
 import { createContext, useContext, useMemo } from "react";
 import { ethers } from "ethers";
+import vaultAbi from "../ui/abi/RecoveryVaultABI.json";
 
+/**
+ * ContractContext
+ * Provides a read-only ethers v6 provider and the RecoveryVault contract instance.
+ * - Env vars: VITE_RPC_URL, VITE_VAULT_ADDRESS
+ * - Logs and error messages in English (project standard)
+ * - Use with Reown AppKit for signer in write paths
+ */
 const ContractContext = createContext(null);
 
+/**
+ * @param {{ children: import('react').ReactNode }} props
+ */
 export function ContractProvider({ children }) {
   const value = useMemo(() => {
     try {
@@ -14,13 +25,12 @@ export function ContractProvider({ children }) {
         return null;
       }
 
+      // Read-only provider (JsonRpcProvider). For writes, retrieve signer via Reown AppKit hooks.
       const provider = new ethers.JsonRpcProvider(rpcUrl);
 
-      // TIP: Import ABI from local file generated at build time
-      // import vaultAbi from "../abi/RecoveryVault.abi.json";
-      const vaultAbi = []; // TODO: replace with actual ABI
-
+      // RecoveryVault read-only contract instance
       const vault = new ethers.Contract(vaultAddress, vaultAbi, provider);
+
       return { provider, vault };
     } catch (err) {
       console.error("[Contract] Failed to init contracts:", err);
