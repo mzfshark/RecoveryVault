@@ -3,6 +3,8 @@ import RecoveryRedeemPanel from "../components/recovery/RecoveryRedeemPanel";
 import { useContracts } from "../contexts/ContractContext";
 import { useOnePrice } from "@/hooks/useOnePrice";
 import styles from "../styles/Global.module.css";
+import ThemeToggle from "@/components/shared/ThemeToggle";
+
 
 /**
  * Recovery Page
@@ -18,7 +20,11 @@ export default function Recovery() {
   return (
     <div className={styles.container}>
       <div className={styles.card} role="region" aria-label="Recovery overview">
-        <h2>{projectName}</h2>
+        <div className={styles.row}>
+          <h2>{projectName}</h2>
+          <ThemeToggle />
+        </div>
+
         <p className={styles.muted}>Fixed redemption UI for pre-hack wallets on Harmony.</p>
         {typeof onePrice === "number" && (
           <div className={styles.row}>

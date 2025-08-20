@@ -92,7 +92,6 @@ label{
 }
 
 .input,.select{
-  width:100%;
   padding:.6rem .8rem;
   border:none;
   background:var(--input-bg);
