@@ -2,5 +2,6 @@
 artifacts
 .deps
 node_modules
-.env.*
+.env.local
+.env.production
 cache
