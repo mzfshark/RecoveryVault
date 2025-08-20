@@ -1,7 +1,7 @@
 import WalletConnection from "../components/wallet/WalletConnection";
 import RecoveryRedeemPanel from "../components/recovery/RecoveryRedeemPanel";
 import { useContracts } from "../contexts/ContractContext";
-import useOnePrice from "../hooks/useOnePrice";
+import { useOnePrice } from "@/hooks/useOnePrice";
 import styles from "../styles/Global.module.css";
 
 /**

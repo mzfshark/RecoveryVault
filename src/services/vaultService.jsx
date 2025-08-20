@@ -98,32 +98,30 @@ export async function quoteRedeem(provider, tokenIn, amount, preferUSDC = true) 
 }
 
 /** Execute redemption. Ensures allowance if the vault pulls tokenIn. */
-export async function redeem(signer, { tokenIn, amount, preferUSDC }) {
+export async function redeem(signer, { tokenAddress, amount, receiver, receiveOne=false, merkleProof=[] }) {
   try {
-    if (!signer) throw new Error("Signer is required");
-    if (!tokenIn) throw new Error("tokenIn is required");
-    if (!amount || amount <= 0n) throw new Error("amount must be > 0");
+    const vault = getVault(signer);
+    const from = await signer.getAddress();
+    const to = receiver && isAddress(receiver) ? receiver : from;
 
-    const vault = getVaultContract(signer);
-    const user = await signer.getAddress();
+    const token = new Contract(assertAddr("tokenAddress", tokenAddress), ERC20_ABI, signer);
+    const decimals = await token.decimals();
+    const amt = parseUnits(String(amount), decimals);
 
-    // 1) Merkle proof
-    const proof = await fetchMerkleProof(user);
+    await ensureAllowance(signer, tokenAddress, from, VAULT_ADDRESS, amt);
 
-    // 2) Allowance (optional)
-    try {
-      const spender = vault.target; // ethers v6 contract address
-      await ensureAllowance(signer, tokenIn, spender, amount);
-    } catch (approveErr) {
-      console.error("[VaultService] approve path error:", approveErr);
-    }
-
-    // 3) Redeem
-    const tx = await vault.redeem(tokenIn, amount, preferUSDC, proof);
-    const receipt = await tx.wait();
-    return receipt;
-  } catch (err) {
-    console.error("[VaultService] redeem error:", err);
+    // ajuste a assinatura conforme seu RecoveryVault.sol
+    const tx = await vault.redeem(
+      tokenAddress,   // address tokenIn
+      amt,            // uint256 amount
+      to,             // address receiver (!!!)
+      Boolean(receiveOne),
+      merkleProof
+    );
+    console.log("[VaultService] redeem tx:", tx.hash);
+    return await tx.wait();
+  } catch (e) {
+    console.error("[VaultService] redeem error:", e);
     throw new Error("Redeem failed. See console for details.");
   }
 }

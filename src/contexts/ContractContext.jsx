@@ -1,54 +1,109 @@
-import { createContext, useContext, useMemo } from "react";
-import { ethers } from "ethers";
-import vaultAbi from "../ui/abi/RecoveryVaultABI.json";
+// src/contexts/ContractContext.jsx
+import { createContext, useContext, useEffect, useMemo, useState, useCallback } from "react";
+import { BrowserProvider, JsonRpcProvider } from "ethers";
 
-/**
- * ContractContext
- * Provides a read-only ethers v6 provider and the RecoveryVault contract instance.
- * - Env vars: VITE_RPC_URL, VITE_VAULT_ADDRESS
- * - Logs and error messages in English (project standard)
- * - Use with Reown AppKit for signer in write paths
- */
-const ContractContext = createContext(null);
+const ContractContext = createContext({
+  provider: null,
+  signer: null,
+  account: null,
+  chainId: null,
+  connect: async () => {},
+  disconnect: () => {}
+});
 
-/**
- * @param {{ children: import('react').ReactNode }} props
- */
+export const useContractContext = () => useContext(ContractContext);
+  // ✅ Alias para compatibilidade com componentes antigos
+  /** @deprecated Use `useContractContext` instead. */
+export const useContracts = () => {
+  console.warn("[ContractContext] `useContracts` is deprecated. Use `useContractContext`.");
+  return useContext(ContractContext);
+};
+
+// ✅ e exporte o provider (se ainda não tiver)
 export function ContractProvider({ children }) {
-  const value = useMemo(() => {
-    try {
-      const rpcUrl = import.meta.env.VITE_RPC_URL;
-      const vaultAddress = import.meta.env.VITE_VAULT_ADDRESS;
+  const [provider, setProvider] = useState(null);
+  const [signer, setSigner] = useState(null);
+  const [account, setAccount] = useState(null);
+  const [chainId, setChainId] = useState(null);
 
-      if (!rpcUrl || !vaultAddress) {
-        console.error("[Contract] Missing env vars VITE_RPC_URL or VITE_VAULT_ADDRESS");
-        return null;
-      }
+  // pick provider: injected (BrowserProvider) or fallback RPC
+  useEffect(() => {
+    const rpcUrl = import.meta.env.VITE_RPC_URL_HARMONY;
+    const fallback = rpcUrl ? new JsonRpcProvider(rpcUrl, Number(import.meta.env.VITE_CHAIN_ID ?? 1666600000)) : null;
 
-      // Read-only provider (JsonRpcProvider). For writes, retrieve signer via Reown AppKit hooks.
-      const provider = new ethers.JsonRpcProvider(rpcUrl);
-
-      // RecoveryVault read-only contract instance
-      const vault = new ethers.Contract(vaultAddress, vaultAbi, provider);
-
-      return { provider, vault };
-    } catch (err) {
-      console.error("[Contract] Failed to init contracts:", err);
-      return null;
+    if (typeof window !== "undefined" && window.ethereum) {
+      const injected = new BrowserProvider(window.ethereum);
+      setProvider(injected);
+      (async () => {
+        try {
+          const net = await injected.getNetwork();
+          setChainId(Number(net.chainId));
+        } catch (e) {
+          console.error("[ContractContext] getNetwork error:", e);
+        }
+      })();
+    } else if (fallback) {
+      setProvider(fallback);
+      (async () => {
+        try {
+          const net = await fallback.getNetwork();
+          setChainId(Number(net.chainId));
+        } catch (e) {
+          console.error("[ContractContext] fallback getNetwork error:", e);
+        }
+      })();
+    } else {
+      console.error("[ContractContext] No provider available (no window.ethereum and no VITE_RPC_URL_HARMONY).");
     }
   }, []);
 
-  return (
-    <ContractContext.Provider value={value}>
-      {children}
-    </ContractContext.Provider>
-  );
-}
+  const connect = useCallback(async () => {
+    try {
+      if (!provider || !("send" in provider)) {
+        console.warn("[ContractContext] connect: provider not injectable, skipping requestAccounts.");
+      } else {
+        await provider.send("eth_requestAccounts", []);
+      }
+      const _signer = await provider.getSigner();
+      const addr = await _signer.getAddress();
+      setSigner(_signer);
+      setAccount(addr);
+    } catch (e) {
+      console.error("[ContractContext] connect error:", e);
+    }
+  }, [provider]);
 
-export function useContracts() {
-  const ctx = useContext(ContractContext);
-  if (!ctx) {
-    console.error("[Contract] Context not ready");
-  }
-  return ctx;
+  const disconnect = useCallback(() => {
+    setSigner(null);
+    setAccount(null);
+  }, []);
+
+  // handle account / chain changes (if injected)
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.ethereum) return;
+    const eth = window.ethereum;
+
+    const onAccounts = (accs) => {
+      const a = Array.isArray(accs) && accs.length ? accs[0] : null;
+      setAccount(a);
+      setSigner(null); // force refresh signer on next connect
+    };
+    const onChain = (hexId) => {
+      try { setChainId(parseInt(hexId, 16)); } catch { setChainId(null); }
+      setSigner(null);
+    };
+
+    eth.on?.("accountsChanged", onAccounts);
+    eth.on?.("chainChanged", onChain);
+    return () => {
+      eth.removeListener?.("accountsChanged", onAccounts);
+      eth.removeListener?.("chainChanged", onChain);
+    };
+  }, []);
+
+  const value = useMemo(() => ({
+    provider, signer, account, chainId, connect, disconnect
+  }), [provider, signer, account, chainId, connect, disconnect]);
+
+  return <ContractContext.Provider value={value}>{children}</ContractContext.Provider>;
 }
