@@ -13,7 +13,7 @@ import ThemeToggle from "@/components/shared/ThemeToggle";
  * - All UI texts/logs in English (project standard)
  */
 export default function Recovery() {
-  const projectName = import.meta.env.VITE_PROJECT_NAME || "Recovery Vaul";
+  const projectName = import.meta.env.VITE_PROJECT_NAME || "Recovery Vault";
   const { provider } = useContracts() ?? {};
   const onePrice = useOnePrice(provider);
 
