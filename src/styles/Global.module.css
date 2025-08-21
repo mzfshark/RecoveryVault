@@ -188,9 +188,8 @@ label{
   justify-content:center; 
   gap:var(--space-sm);
   padding:var(--space-md);
-  background:var(--foreground);
+  background:var(--background);
   color:var(--text-secondary);
-  border-top:1px solid var(--gray-200);
   text-align:center;
 }
 .footer a{ 
