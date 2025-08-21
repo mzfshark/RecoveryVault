@@ -1,174 +1,166 @@
-// vaultService.js (ethers v6 ready)
-// All logs and layout texts MUST be in English (per team guidelines)
+// All logs/messages in English. Ethers v6 service for RecoveryVault.sol
+// Align method names with your ABI if they differ.
 
-import { Contract, isAddress } from 'ethers';
-import RecoveryVaultABI from '../../contracts/abis/RecoveryVaultABI';
+import { ethers } from "ethers";
+import vaultAbi from "../ui/abi/RecoveryVaultABI.json";
+import { ensureAllowance } from "./tokenService";
 
-const VAULT_ADDRESS = process.env.VITE_VAULT_ADDRESS;
+export const ZERO = 0n;
+const ONE_DAY = 24n * 60n * 60n; // fallback if ROUND_DELAY() is unavailable
 
-/**
- * Resolve a signer/runner from a provider (supports ethers v6 BrowserProvider)
- * Falls back to the provider itself when signer is not available.
- * @param {any} providerOrSigner
- * @returns {Promise<any>} signer or provider
- */
-async function getRunner(providerOrSigner) {
-  if (!providerOrSigner) {
-    console.error('[vaultService][getRunner] providerOrSigner is undefined/null');
-    throw new Error('Provider or signer not available');
-  }
+/** Returns RecoveryVault address from env. */
+export function getVaultAddress() {
+  const addr = import.meta.env.VITE_VAULT_ADDRESS;
+  if (!addr) throw new Error("VITE_VAULT_ADDRESS is not set");
+  return addr;
+}
+
+/** Returns RecoveryVault contract bound to signer/provider. */
+export function getVaultContract(signerOrProvider) {
+  return new ethers.Contract(getVaultAddress(), vaultAbi, signerOrProvider);
+}
+
+/** Get user daily limit/usage (base units). Adjust to your ABI if needed. */
+export async function getDailyLimit(provider, user) {
   try {
-    // BrowserProvider in ethers v6: getSigner() is async
-    if (typeof providerOrSigner.getSigner === 'function') {
-      const signer = await providerOrSigner.getSigner();
-      return signer ?? providerOrSigner;
-    }
-    return providerOrSigner; // Already a signer or a plain provider
+    const vault = getVaultContract(provider);
+
+    // Common patterns; try both, fall back safely
+    const [limit, used] = await Promise.all([
+      (async () => {
+        try { return await vault.dailyLimit(user); } catch {}
+        try { return await vault.dailyLimitUsd(); } catch {}
+        return ZERO;
+      })(),
+      (async () => {
+        try { return await vault.dailyUsed(user); } catch {}
+        return ZERO;
+      })()
+    ]);
+
+    return { limit: limit ?? ZERO, used: used ?? ZERO };
   } catch (err) {
-    console.error('[vaultService][getRunner] Failed to resolve signer:', err);
-    return providerOrSigner; // Non-fatal: keep provider for read-only
+    console.error("[VaultService] getDailyLimit error:", err);
+    return { limit: ZERO, used: ZERO };
+  }
+}
+
+/** Get current fee in basis points for a given user and amount. */
+export async function getFeeTier(provider, user, amount) {
+  try {
+    const vault = getVaultContract(provider);
+    try {
+      const feeBps = await vault.getFeeBps(user, amount);
+      return Number(feeBps);
+    } catch {}
+    return 100; // 1.00% fallback
+  } catch (err) {
+    console.error("[VaultService] getFeeTier error:", err);
+    return 100;
+  }
+}
+
+/** Fetch Merkle proof off-chain (mock until API is ready). */
+export async function fetchMerkleProof(user) {
+  try {
+    // TODO: replace with real API call:
+    // const res = await fetch(`/api/proof?address=${user}`);
+    // const data = await res.json();
+    // return data.proof;
+    return [];
+  } catch (err) {
+    console.error("[VaultService] fetchMerkleProof error:", err);
+    return [];
+  }
+}
+
+/** Quote redemption output using the vault's logic (USDC or wONE). */
+export async function quoteRedeem(provider, tokenIn, amount, preferUSDC = true) {
+  try {
+    const vault = getVaultContract(provider);
+    const result = await vault.quoteRedeem(tokenIn, amount, preferUSDC);
+
+    // Normalize tuple/struct
+    if (Array.isArray(result)) {
+      const [outAmount, isUSDC] = result;
+      return { outAmount: outAmount ?? ZERO, isUSDC: Boolean(isUSDC) };
+    }
+    if (typeof result === "object" && result) {
+      const outAmount = result.outAmount ?? result[0] ?? ZERO;
+      const isUSDC = result.isUSDC ?? result[1] ?? preferUSDC;
+      return { outAmount, isUSDC: Boolean(isUSDC) };
+    }
+    return { outAmount: ZERO, isUSDC: preferUSDC };
+  } catch (err) {
+    console.error("[VaultService] quoteRedeem error:", err);
+    return { outAmount: ZERO, isUSDC: preferUSDC };
+  }
+}
+
+/** Execute redemption. Ensures allowance if the vault pulls tokenIn. */
+export async function redeem(signer, { tokenAddress, amount, receiver, receiveOne=false, merkleProof=[] }) {
+  try {
+    const vault = getVault(signer);
+    const from = await signer.getAddress();
+    const to = receiver && isAddress(receiver) ? receiver : from;
+
+    const token = new Contract(assertAddr("tokenAddress", tokenAddress), ERC20_ABI, signer);
+    const decimals = await token.decimals();
+    const amt = parseUnits(String(amount), decimals);
+
+    await ensureAllowance(signer, tokenAddress, from, VAULT_ADDRESS, amt);
+
+    // ajuste a assinatura conforme seu RecoveryVault.sol
+    const tx = await vault.redeem(
+      tokenAddress,   // address tokenIn
+      amt,            // uint256 amount
+      to,             // address receiver (!!!)
+      Boolean(receiveOne),
+      merkleProof
+    );
+    console.log("[VaultService] redeem tx:", tx.hash);
+    return await tx.wait();
+  } catch (e) {
+    console.error("[VaultService] redeem error:", e);
+    throw new Error("Redeem failed. See console for details.");
   }
 }
 
 /**
- * Get a RecoveryVault contract instance.
- * If readOnly = true, binds to provider directly (no signer required).
- * @param {any} providerOrSigner
- * @param {{ readOnly?: boolean }} [opts]
- * @returns {Promise<Contract|null>}
+ * High-level vault status derived from contract variables (per provided snippet):
+ * - isLocked() → bool
+ * - roundStart() → uint256
+ * - roundFunds() → uint256
+ * - paused() → bool (optional, if Pausable is used)
+ * - ROUND_DELAY() → uint256 (public constant; optional getter)
  */
-async function getVaultContract(providerOrSigner, opts = {}) {
-  const { readOnly = false } = opts;
+export async function getVaultStatus(provider) {
   try {
-    if (!VAULT_ADDRESS || !isAddress(VAULT_ADDRESS)) {
-      console.error('[vaultService][getVaultContract] Invalid or missing VAULT_ADDRESS:', VAULT_ADDRESS);
-      throw new Error('Invalid contract address');
-    }
-    const runner = readOnly ? providerOrSigner : await getRunner(providerOrSigner);
-    return new Contract(VAULT_ADDRESS, RecoveryVaultABI, runner);
-  } catch (err) {
-    console.error('[vaultService][getVaultContract] Failed to create contract instance:', err);
-    return null;
-  }
-}
+    const vault = getVaultContract(provider);
 
-/**
- * Redeem depegged token using whitelist proof.
- * @param {any} providerOrSigner
- * @param {string} token - ERC20 token address to redeem
- * @param {string|bigint} amount - amount in wei
- * @param {string[]} proof - Merkle proof array
- * @returns {Promise<string>} transaction hash
- */
-export async function redeem(providerOrSigner, token, amount, proof) {
-  try {
-    if (!isAddress(token)) {
-      console.error('[vaultService][redeem] Invalid token address:', token);
-      throw new Error('Invalid token address');
-    }
-    if (amount === undefined || amount === null) {
-      console.error('[vaultService][redeem] Amount is missing');
-      throw new Error('Amount is required');
-    }
-    const vault = await getVaultContract(providerOrSigner);
-    if (!vault) throw new Error('Contract instance not available');
+    // Parallel reads with safe fallbacks
+    const [paused, locked, roundStart, roundFunds, roundDelay] = await Promise.all([
+      (async () => { try { return Boolean(await vault.paused()); } catch { return false; } })(),
+      (async () => { try { return Boolean(await vault.isLocked()); } catch { return false; } })(),
+      (async () => { try { return await vault.roundStart(); } catch { return 0n; } })(),
+      (async () => { try { return await vault.roundFunds(); } catch { return 0n; } })(),
+      (async () => { try { return await vault.ROUND_DELAY(); } catch { return ONE_DAY; } })()
+    ]);
 
-    const tx = await vault.redeem(token, amount, proof);
-    const receipt = await tx.wait();
-    return (receipt && receipt.hash) ? receipt.hash : tx.hash;
-  } catch (err) {
-    // Bubble up a clean error, but keep verbose log for debugging
-    console.error('[vaultService][redeem] Redemption failed:', err);
-    throw new Error(err?.reason || err?.shortMessage || err?.message || 'Redemption failed');
-  }
-}
+    const now = BigInt(Math.floor(Date.now() / 1000));
 
-/**
- * Get remaining user limit for current window/round.
- * @param {any} providerOrSigner
- * @param {string} wallet - wallet address
- * @returns {Promise<string|null>} remaining limit in wei as string, or null on error
- */
-export async function getUserLimit(providerOrSigner, wallet) {
-  try {
-    if (!isAddress(wallet)) {
-      console.error('[vaultService][getUserLimit] Invalid wallet address:', wallet);
-      return null;
-    }
-    const vault = await getVaultContract(providerOrSigner, { readOnly: true });
-    if (!vault) return null;
-    const remaining = await vault.getRemainingLimit(wallet);
-    return remaining?.toString?.() ?? String(remaining);
-  } catch (err) {
-    console.error('[vaultService][getUserLimit] Failed to fetch user limit:', err);
-    return null;
-  }
-}
+    // If locked, next unlock assumed to be roundStart (start after delay/funding)
+    const nextUnlockAt = locked ? roundStart : 0n;
 
-/**
- * Calculate fee for a given token and amount.
- * @param {any} providerOrSigner
- * @param {string} token - token address
- * @param {string|bigint} amount - amount in wei
- * @returns {Promise<string|null>} fee in wei as string, or null on error
- */
-export async function getFee(providerOrSigner, token, amount) {
-  try {
-    if (!isAddress(token)) {
-      console.error('[vaultService][getFee] Invalid token address:', token);
-      return null;
-    }
-    if (amount === undefined || amount === null) {
-      console.error('[vaultService][getFee] Amount is missing');
-      return null;
-    }
-    const vault = await getVaultContract(providerOrSigner, { readOnly: true });
-    if (!vault) return null;
-    const fee = await vault.calculateFee(token, amount);
-    return fee?.toString?.() ?? String(fee);
-  } catch (err) {
-    console.error('[vaultService][getFee] Failed to calculate fee:', err);
-    return null;
-  }
-}
+    // Round considered active if: not paused, not locked, started, and funds available
+    const roundActive = Boolean(!paused && !locked && now >= roundStart && roundFunds > 0n);
 
-/**
- * Get round status (current round id and aggregate amounts)
- * @param {any} providerOrSigner
- * @returns {Promise<{ roundId: string, totalAvailable: string, totalRedeemed: string } | null>}
- */
-export async function getRoundStatus(providerOrSigner) {
-  try {
-    const vault = await getVaultContract(providerOrSigner, { readOnly: true });
-    if (!vault) return null;
-    const roundId = await vault.getCurrentRoundId();
-    const info = await vault.getRoundInfo(roundId);
-    // Defensive: support tuple/struct response shapes
-    const totalAvailable = info?.totalAvailable ?? info?.[0];
-    const totalRedeemed = info?.totalRedeemed ?? info?.[1];
-    return {
-      roundId: roundId?.toString?.() ?? String(roundId),
-      totalAvailable: totalAvailable?.toString?.() ?? String(totalAvailable),
-      totalRedeemed: totalRedeemed?.toString?.() ?? String(totalRedeemed),
-    };
-  } catch (err) {
-    console.error('[vaultService][getRoundStatus] Failed to fetch round status:', err);
-    return null;
-  }
-}
+    // You may compute an inferred roundEnd if your logic exposes it; keeping 0n here
+    const roundEnd = 0n;
 
-/**
- * Check if the vault is currently locked (cooldown / not started)
- * @param {any} providerOrSigner
- * @returns {Promise<boolean>} true if locked (or on error)
- */
-export async function isLocked(providerOrSigner) {
-  try {
-    const vault = await getVaultContract(providerOrSigner, { readOnly: true });
-    if (!vault) return true;
-    return Boolean(await vault.isLocked());
+    return { paused, locked, roundActive, nextUnlockAt, roundStart, roundEnd, roundFunds, roundDelay };
   } catch (err) {
-    console.error('[vaultService][isLocked] Failed to check lock state:', err);
-    return true; // safer fallback
+    console.error("[VaultService] getVaultStatus error:", err);
+    return { paused: false, locked: false, roundActive: false, nextUnlockAt: 0n, roundStart: 0n, roundEnd: 0n, roundFunds: 0n, roundDelay: ONE_DAY };
   }
 }

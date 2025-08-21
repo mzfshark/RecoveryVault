@@ -2,7 +2,7 @@ require('@nomicfoundation/hardhat-toolbox');
 require('dotenv').config();
 require('@nomicfoundation/hardhat-verify');
 
-const privateKey = process.env.PKEY || '';
+const privateKey = process.env.secret.DEPLOYER_PKEY || '';
 // Fallback initialOwner if not set via environment
 const initialOwner = process.env.INITIAL_OWNER || '0x45B96eD5d5B18f4f865266D8371C662Cd241e6D5';
 
@@ -30,14 +30,14 @@ module.exports = {
     networks: {
       hardhat: {},
       harmony: {
-        url: process.env.VITE_RPC_URL_HARMONY || '',
+        url: process.env.VITE_RPC_URL || '',
         accounts: privateKey ? [`0x${privateKey}`] : []
       }
     },
 
     etherscan: {
       apiKey: {
-        harmony: process.env.HARMONY_EXPLORER_API_KEY || ''
+        harmony: process.env.VITE_HARMONY_EXPLORER_API_KEY || ''
       },
       customChains: [
         {
