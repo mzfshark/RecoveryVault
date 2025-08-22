@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { useAppKit, useDisconnect, useAppKitAccount } from '@reown/appkit/react';
 import styles from '../../styles/Global.module.css';
+import { FiCopy, FiPower } from "react-icons/fi";
 /**
  * WalletConnection
  * - Connect/Disconnect wallet using Reown AppKit
@@ -26,20 +27,20 @@ export default function WalletConnection() {
   }
 
   return (
-    <div className={styles.card} aria-live="polite">
+    
       <div className={styles.row}>
-        <h3>Wallet</h3>
+
         {isConnected ? (
-          <div className={styles.row}>
+          <div className={styles.rowSm}>
             <span className={styles.badge} title={address}>{short}</span>
-            <button className={styles.button} onClick={onCopy}>Copy</button>
-            <button className={styles.button} onClick={() => disconnect()}>Disconnect</button>
+            <button className={styles.ButtonIconClean} onClick={onCopy}><FiCopy size={12} /></button>
+            <button onClick={() => disconnect()} className={`${styles.button} ${styles.buttonIcon}`}> <FiPower size={16} /> </button>
           </div>
         ) : (
-          <button className={styles.primary} onClick={() => open({ view: 'Connect' })}>Connect Wallet</button>
+          <button className={`${styles.button} ${styles.buttonIcon} `} onClick={() => open({ view: 'Connect' })}><FiPower size={16} /></button>
         )}
       </div>
-    </div>
+    
   );
 }
 
