@@ -1,18 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import styles from "@/styles/Global.module.css";
 import { useContractContext } from "@/contexts/ContractContext";
-import Footer from "@/ui/layout/footer.jsx";
+import Footer from "@/ui/layout/footer";
 import * as vaultService from "@/services/vaultService";
 import { formatUnits } from "ethers";
 import { useAppKitAccount } from "@reown/appkit/react";
-import WalletConnection from "@/components/wallet/WalletConnection.jsx";
+import WalletConnection from "@/components/wallet/WalletConnection";
 import WalletChecker from "@/components/wallet/WalletChecker";
 import RedeemForm from "@/components/redeem/RedeemForm";
 import ContractFunds from "@/components/shared/ContractFunds";
-import StatusRound from "@/components/shared/StatusRound.jsx";
-
-
-
+import StatusRound from "@/components/shared/StatusRound";
+import LimitChecker from "@/components/wallet/LimitChecker";
 
 const shorten = (addr) => (addr ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : "-");
 
@@ -25,7 +23,7 @@ function ReCAPTCHAMock({ value, onChange }) {
   );
 }
 
-function HeaderFrame({ roundInfo, isConnected, limitText}) {
+function HeaderFrame({ address }) {
   return (
     <header className={styles.header}>
       <div className={styles.containerWide}>
@@ -33,21 +31,16 @@ function HeaderFrame({ roundInfo, isConnected, limitText}) {
           <div className={styles.headerLeft}>
             <img src="/logo.png" alt="Recovery Vault" className={styles.logoImg} />
           </div>
-          <div className={styles.headerCenter}>
-       
-          </div>
+          <div className={styles.headerCenter}></div>
           <div className={styles.headerRight}>
             <div className={styles.headerRightInner}>
               <WalletConnection />
             </div>
-            <div className={styles.headerRightInner}>  
+            <div className={styles.headerRightInner}>
               <div className="walletLimit">
-                {isConnected ? (
-                <span className={`${styles.badgeWalletLimit}`}>Available limit: <strong>{limitText ?? "$"}</strong></span>
-              ) : null}
+                <LimitChecker address={address} />
               </div>
             </div>
-
           </div>
         </div>
       </div>
@@ -64,8 +57,14 @@ function ContentFrame({ children }) {
 }
 
 function Alert({ type = "info", children }) {
-  const cls = `${styles.alert} ${type === "error" ? styles.error : type === "success" ? styles.success : type === "warning" ? styles.warning : styles.info}`;
-  return <div role="alert" className={cls}>{children}</div>;
+  const cls = `${styles.alert} ${
+    type === "error" ? styles.error : type === "success" ? styles.success : type === "warning" ? styles.warning : styles.info
+  }`;
+  return (
+    <div role="alert" className={cls}>
+      {children}
+    </div>
+  );
 }
 
 export default function Recovery() {
@@ -94,24 +93,26 @@ export default function Recovery() {
     localStorage.setItem("theme", theme);
   }, [theme]);
 
-  
+  // ✅ Updated: uses getVaultStatus instead of getCurrentRound/isLocked
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const [round, locked] = await Promise.all([
-          vaultService.getCurrentRound?.(provider),
-          vaultService.isLocked?.(provider)
-        ]);
+        const status = await vaultService.getVaultStatus?.(provider);
         if (!alive) return;
-        setRoundInfo({ loading: false, round: round ?? "-", statusText: locked ? "Locked" : "Open" });
+        const statusText = status?.paused ? "Paused" : status?.locked ? "Locked" : "Open";
+        const roundLabel = status?.roundStart ? String(status.roundStart) : "-";
+        setRoundInfo({ loading: false, round: roundLabel, statusText });
       } catch {
         if (alive) setRoundInfo({ loading: false, round: "-", statusText: "Unknown" });
       }
     })();
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [provider]);
 
+  // ✅ Updated: uses getDailyLimit instead of getLimit
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -121,14 +122,17 @@ export default function Recovery() {
           if (alive) setUserInfo({ connected: false, address: "", limitText: "-" });
           return;
         }
-        const limitWei = await vaultService.getLimit?.(addr, provider);
-        const limitText = limitWei != null ? `${formatUnits(BigInt(limitWei), 18)} ONE` : "-";
+        const { limit, used } = await vaultService.getDailyLimit?.(provider, addr);
+        const remaining = (limit ?? 0n) > (used ?? 0n) ? limit - used : 0n;
+        const limitText = `${formatUnits(remaining, 18)} ONE`;
         if (alive) setUserInfo({ connected: true, address: addr, limitText });
       } catch {
         if (alive) setUserInfo({ connected: Boolean(account), address: account || "", limitText: "-" });
       }
     })();
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [account, provider, appkitAccount?.address]);
 
   // Reset eligibility when account changes
@@ -143,27 +147,24 @@ export default function Recovery() {
 
   return (
     <div className={styles.page}>
-      <HeaderFrame roundInfo={roundInfo} isConnected={userInfo.connected} limitText={userInfo.limitText} theme={theme} onToggleTheme={onToggleTheme} />
+      <HeaderFrame
+        roundInfo={roundInfo}
+        isConnected={userInfo.connected}
+        limitText={userInfo.limitText}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
+      />
       <ContentFrame>
-
         {/* wallet checker */}
         <section className={styles.grid3}>
-          <WalletChecker
-            address={userInfo.address || account}
-            onResult={handleEligibility}
-            proofsUrl={PROOFS_URL}
-          />
+          <WalletChecker address={userInfo.address || account} onResult={handleEligibility} proofsUrl={PROOFS_URL} />
           <ContractFunds />
           <StatusRound />
         </section>
 
         {/* ReddemForm */}
         <section className={`${styles.grid1} ${styles.gridInner}`}>
-        <RedeemForm 
-          address={userInfo.address || account}
-          eligible={eligible}
-          proof={proof} 
-        />
+          <RedeemForm address={userInfo.address || account} eligible={eligible} proof={proof} />
         </section>
       </ContentFrame>
       <Footer className={styles.footer} />
