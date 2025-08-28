@@ -1,316 +1,605 @@
+// src/components/redeem/RedeemForm.jsx
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ethers } from "ethers";
+import { ethers, formatUnits, parseUnits } from "ethers";
+import { useAppKitAccount } from "@reown/appkit/react";
 import styles from "@/styles/Global.module.css";
 import { useContractContext } from "@/contexts/ContractContext";
-import useRedeem from "@/hooks/useRedeem";
 import * as vaultService from "@/services/vaultService";
-import ReCAPTCHA from "react-google-recaptcha";
 import TokenSelect from "@/components/shared/TokenSelect";
+import ReCAPTCHA from "react-google-recaptcha";
+import { preloadProofs, checkWhitelist, useWhitelist } from "@/services/whitelistService";
+import { preflightAmountAgainstLimit, quoteAmountUsd18, fetchRemainingUsd18 } from "@/services/limitsService";
 
-export default function RedeemForm({ address, eligible = null, proof = [] }) {
-  // --- debug helper ---
-  const dbg = (...args) => console.debug("[RedeemForm]", ...args);
+const FN_REDEEM_CANDIDATES = ["redeem(address,uint256,address,bytes32[])"];
 
+function friendlySimError(text) {
+  const t = String(text || "").toLowerCase();
+  if (t.includes("address not whitelisted")) return "Address not whitelisted";
+  if (t.includes("insufficient remaining daily limit")) return "Insufficient remaining daily limit";
+  if (t.includes("amount exceeds daily limit")) return "Insufficient remaining daily limit";
+  if (t.includes("missing revert data")) return "Execution reverted (no reason). Check args/signature.";
+  if (t.includes("execution reverted")) return "Execution reverted";
+  return text || "Simulation failed";
+}
+
+function dbg(...a) {
+  console.debug("[RedeemForm]", ...a);
+}
+
+const ERC20_MINI = [
+  "function allowance(address owner, address spender) view returns (uint256)",
+  "function approve(address spender, uint256 value) returns (bool)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)",
+  "function balanceOf(address) view returns (uint256)",
+];
+
+const VAULT_READ_ABI = ["function fixedUsdPrice(address token) view returns (uint256)"];
+
+export default function RedeemForm({ address: addressProp }) {
   const { provider: ctxProvider } = useContractContext();
-  const readProvider = useMemo(() => {
-    const p = ctxProvider || vaultService.getDefaultProvider?.() || null;
-    console.debug("[RedeemForm] readProvider memo ->", !!p);
-    return p;
-  }, [ctxProvider]);
+  const { isConnected, address: appkitAddress } = useAppKitAccount();
 
-  const {
-    state, plan, display, reasons, warnings,
-    prepare, execute, canPrepare, canExecute,
-    progress, receipts, error: hookError, reset
-  } = useRedeem(readProvider);
+  const readProvider = useMemo(() => vaultService.getDefaultProvider?.() || null, []);
+  const address = useMemo(() => addressProp || appkitAddress || "", [addressProp, appkitAddress]);
 
-  // Tokens e addresses do cofre
-  const [supportedTokens, setSupportedTokens] = useState([]); // [{address, symbol?}]
+  // Vault data
+  const [supportedTokens, setSupportedTokens] = useState([]);
   const [wone, setWone] = useState("");
   const [usdc, setUsdc] = useState("");
+  const [usdcDecimals, setUsdcDecimals] = useState(6);
+  const [vaultBalances, setVaultBalances] = useState({ woneBalance: 0n, usdcBalance: 0n });
 
-  // Form state
+  // Form
   const [tokenIn, setTokenIn] = useState("");
   const [redeemIn, setRedeemIn] = useState("");
   const [amountHuman, setAmountHuman] = useState("");
 
-  // reCAPTCHA
-  const recaptchaSiteKey = import.meta.env.VITE_RECAPTCHA_SITE_KEY;
-  const recaptchaRef = useRef(null);
-  const [recaptchaToken, setRecaptchaToken] = useState("");
+  // Wallet token meta
+  const [balances, setBalances] = useState(new Map());
+  const selected = tokenIn ? balances.get(tokenIn.toLowerCase()) : null;
+  const selectedBalance = selected?.raw ?? 0n;
+  const selectedDecimals = selected?.decimals ?? 18;
+  const selectedSymbol = selected?.symbol ?? "";
 
-  // Round hold state (ROUND_DELAY)
-  const [holdInfo, setHoldInfo] = useState({ isHold: false, startTime: 0, now: Math.floor(Date.now()/1000) });
+  // Preço fixo (texto)
+  const [fixedPriceText, setFixedPriceText] = useState("");
+
+  // USD em 18 decimais (contrato)
+  const [limitUSD18, setLimitUSD18] = useState(0n);
+  const [amountUSD18, setAmountUSD18] = useState(0n);
+
+  // UI
+  const [busy, setBusy] = useState(false);
+  const [loadingBase, setLoadingBase] = useState(true);
+  const [loadingBalances, setLoadingBalances] = useState(false);
   const [uiNotice, setUiNotice] = useState(null);
 
-  // --- lifecycle debug ---
+  // reCAPTCHA
+  const recaptchaSiteKey = import.meta.env.VITE_RECAPTCHA_SITE_KEY;
+  const RECAPTCHA_ENABLED = import.meta.env.VITE_ENABLE_RECAPTCHA === "true";
+  const recaptchaRef = useRef(null);
+
   useEffect(() => {
-    dbg("mount", { address, eligible, proofLen: Array.isArray(proof) ? proof.length : 0 });
-    return () => dbg("unmount");
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    preloadProofs().catch(() => {});
+  }, []);
 
-  useEffect(() => { dbg("provider changed", !!readProvider); }, [readProvider]);
-  useEffect(() => { dbg("state", state); }, [state]);
-  useEffect(() => { if (plan) dbg("plan updated", { ok: plan.ok, steps: plan.steps?.length || 0 }); }, [plan]);
-  useEffect(() => { if (display) dbg("display updated", display); }, [display]);
-  useEffect(() => { if (reasons?.length) dbg("reasons", reasons); }, [reasons]);
-  useEffect(() => { if (warnings?.length) dbg("warnings", warnings); }, [warnings]);
-  useEffect(() => { if (hookError) dbg("hookError", hookError); }, [hookError]);
-  useEffect(() => { if (progress) dbg("progress", progress); }, [progress]);
-  useEffect(() => { if (state === 'success') dbg("success receipts", receipts); }, [state, receipts]);
-  useEffect(() => { dbg("tokenIn", tokenIn); }, [tokenIn]);
-  useEffect(() => { dbg("redeemIn", redeemIn); }, [redeemIn]);
-  useEffect(() => { dbg("amountHuman", amountHuman); }, [amountHuman]);
-
-  // Carregar dados do contrato para preencher selects
+  // Base load
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        dbg("load supported tokens: start", { hasProvider: !!readProvider });
         if (!readProvider) return;
-        const [list, w, u] = await Promise.all([
-          vaultService.getSupportedTokens(readProvider).catch(() => []),
-          vaultService.wONE(readProvider).catch(() => ""),
-          vaultService.usdc(readProvider).catch(() => ""),
+        setLoadingBase(true);
+
+        const [sup, w, u, bals] = await Promise.all([
+          vaultService.getSupportedTokens?.(readProvider).catch(() => []),
+          vaultService.wONE?.(readProvider).catch(() => ""),
+          vaultService.usdc?.(readProvider).catch(() => ""),
+          vaultService.getVaultBalances?.(readProvider).catch(() => ({ woneBalance: 0n, usdcBalance: 0n })),
         ]);
+
         if (!alive) return;
-        dbg("load supported tokens: done", { count: (list || []).length, w, u });
-        setSupportedTokens((list || []).map((addr) => ({ address: addr })));
+
+        const supArr = Array.isArray(sup) ? sup.filter(Boolean) : [];
+        setSupportedTokens(supArr);
         setWone(w || "");
         setUsdc(u || "");
-        // Defaults
-        if (!redeemIn && (w || u)) setRedeemIn(w || u);
-        if (!tokenIn && list && list[0]) setTokenIn(list[0]);
+        setVaultBalances(bals || { woneBalance: 0n, usdcBalance: 0n });
+
+        if (u) {
+          try {
+            const erc = new ethers.Contract(u, ERC20_MINI, readProvider);
+            const d = await erc.decimals();
+            setUsdcDecimals(Number(d) || 6);
+          } catch {
+            setUsdcDecimals(6);
+          }
+        }
+
+        if (!redeemIn) {
+          if ((bals?.woneBalance ?? 0n) > 0n) setRedeemIn(w || "");
+          else if ((bals?.usdcBalance ?? 0n) > 0n) setRedeemIn(u || "");
+          else setRedeemIn(w || u || "");
+        }
+        if (!tokenIn && supArr[0]) setTokenIn(supArr[0]);
       } catch (e) {
-        console.warn("[RedeemForm] load supported tokens error:", e);
+        console.warn("[RedeemForm] base load error:", e);
+      } finally {
+        if (alive) setLoadingBase(false);
       }
     })();
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+    };
   }, [readProvider]);
 
-  // Detecta se o round está em HOLD (ROUND_DELAY ainda em curso)
+
+  // Wallet balances
   useEffect(() => {
     let alive = true;
     (async () => {
-      if (!readProvider) return;
       try {
-        const info = await vaultService.getRoundInfo(readProvider);
-        const now = Math.floor(Date.now() / 1000);
-        const startTime = Number(info?.startTime || 0);
-        const paused = Boolean(info?.paused);
-        const locked = await vaultService.isLocked(readProvider).catch(() => false);
-        const isHold = !paused && !locked && !!startTime && now < startTime;
-        dbg("hold check", { now, startTime, paused, locked, isHold });
-        if (alive) setHoldInfo({ isHold, startTime, now });
+        if (!readProvider || !address || supportedTokens.length === 0) return;
+
+        setLoadingBalances(true);
+
+        const entries = await Promise.all(
+          supportedTokens.map(async (addr) => {
+            try {
+              const erc = new ethers.Contract(addr, ERC20_MINI, readProvider);
+              const [dec, sym, bal] = await Promise.all([
+                erc.decimals(),
+                erc.symbol().catch(() => "TOKEN"),
+                erc.balanceOf(address).catch(() => 0n),
+              ]);
+              return [addr.toLowerCase(), { raw: bal ?? 0n, decimals: Number(dec) || 18, symbol: String(sym || "TOKEN") }];
+            } catch {
+              return [addr.toLowerCase(), { raw: 0n, decimals: 18, symbol: "TOKEN" }];
+            }
+          })
+        );
+
+        if (!alive) return;
+        setBalances(new Map(entries));
       } catch (e) {
-        console.warn("[RedeemForm] hold check error:", e);
-        if (alive) setHoldInfo((h) => ({ ...h, isHold: false }));
+        console.warn("[RedeemForm] wallet balances load error:", e);
+      } finally {
+        if (alive) setLoadingBalances(false);
       }
     })();
-    return () => { alive = false; };
-  }, [readProvider]);
+    return () => {
+      alive = false;
+    };
+  }, [readProvider, address, supportedTokens]);
 
-  // Elegibilidade/whitelist — apenas informativo; o contrato valida de novo na quote
-  const eligibilityMsg = useMemo(() => {
-    const msg = eligible === true
-      ? { type: "success", text: "You are eligible to redeem." }
-      : eligible === false
-        ? { type: "warning", text: "Wallet not found in whitelist. You may not proceed." }
-        : null;
-    dbg("eligibilityMsg", msg);
-    return msg;
-  }, [eligible]);
+  // Metadata for newly picked token
+  useEffect(() => {
+    (async () => {
+      if (!readProvider || !address || !tokenIn) return;
+      const key = tokenIn.toLowerCase();
+      if (balances.has(key)) return;
+      try {
+        const erc = new ethers.Contract(tokenIn, ERC20_MINI, readProvider);
+        const [dec, sym, bal] = await Promise.all([
+          erc.decimals(),
+          erc.symbol().catch(() => "TOKEN"),
+          erc.balanceOf(address).catch(() => 0n),
+        ]);
+        setBalances((prev) => {
+          const copy = new Map(prev);
+          copy.set(key, { raw: bal ?? 0n, decimals: Number(dec) || 18, symbol: String(sym || "TOKEN") });
+          return copy;
+        });
+      } catch {
+        /* ignore */
+      }
+    })();
+  }, [readProvider, address, tokenIn, balances]);
 
-  const user = address || "";
+  // Fixed price display
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        setFixedPriceText("");
+        if (!readProvider || !tokenIn) return;
 
-  const onPreview = useCallback(async () => {
-    dbg("onPreview click", { user, tokenIn, amountHuman, redeemIn, proofLen: Array.isArray(proof) ? proof.length : 0, hold: holdInfo.isHold });
-    setUiNotice(null);
-    if (holdInfo.isHold) {
-      const when = holdInfo.startTime ? new Date(holdInfo.startTime * 1000).toLocaleString() + " UTC" : "—";
-      const text = `Round is On Hold until ${when}.`;
-      dbg("onPreview blocked by hold", { when });
-      setUiNotice({ type: "warning", text });
-      return;
+        const vaultAddr = vaultService.getVaultAddress?.() || import.meta.env.VITE_VAULT_ADDRESS || "";
+        if (!vaultAddr) return;
+
+        const c = new ethers.Contract(vaultAddr, VAULT_READ_ABI, readProvider);
+        const p = await c.fixedUsdPrice(tokenIn).catch(() => 0n);
+        const txt = formatUnits(p ?? 0n, 18);
+        if (!alive) return;
+        if (p && p !== 0n) {
+          const num = Number(txt);
+          setFixedPriceText(Number.isFinite(num) ? `$${num.toFixed(6)}` : `$${txt}`);
+        } else {
+          setFixedPriceText("");
+        }
+      } catch {
+        if (alive) setFixedPriceText("");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [readProvider, tokenIn]);
+
+  // Whitelist hook
+  const { loading: wlLoading, ok: wlOk, error: wlError, proof: wlProof } = useWhitelist(address, readProvider);
+
+  // Limite diário restante (USD 18dps) - alinhado com vaultService/LimitChecker
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        if (!readProvider || !address) return;
+        const rem = await fetchRemainingUsd18(readProvider, address);
+        if (alive) setLimitUSD18(rem);
+      } catch {
+        if (alive) setLimitUSD18(0n);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [readProvider, address]);
+
+  // USD do pedido (USD 18dps)
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!readProvider || !tokenIn || !amountHuman || Number(amountHuman) <= 0) {
+          setAmountUSD18(0n);
+          return;
+        }
+        const usd18 = await quoteAmountUsd18(readProvider, tokenIn, amountHuman, selectedDecimals);
+        setAmountUSD18(usd18);
+      } catch {
+        setAmountUSD18(0n);
+      }
+    })();
+  }, [readProvider, tokenIn, amountHuman, selectedDecimals]);
+
+  const onMax = useCallback(() => {
+    try {
+      const human = formatUnits(selectedBalance ?? 0n, selectedDecimals ?? 18);
+      setAmountHuman(human);
+    } catch (e) {
+      console.warn("[RedeemForm] onMax error:", e);
     }
-    if (!canPrepare) { dbg("onPreview blocked: canPrepare=false"); return; }
-    const r = await prepare({ user, tokenIn, amountHuman, redeemIn, proof });
-    dbg("onPreview result", { ok: r?.ok, reasons: r?.reasons?.length || 0 });
-  }, [canPrepare, prepare, user, tokenIn, amountHuman, redeemIn, proof, holdInfo]);
+  }, [selectedBalance, selectedDecimals]);
 
   const onConfirm = useCallback(async () => {
-    dbg("onConfirm click", { canExecute, state, hold: holdInfo.isHold });
-    if (holdInfo.isHold) {
-      const when = holdInfo.startTime ? new Date(holdInfo.startTime * 1000).toLocaleString() + " UTC" : "—";
-      setUiNotice({ type: "warning", text: `Round is On Hold until ${when}.` });
-      return;
-    }
-    // Se site key está configurada, exige reCAPTCHA
-    if (recaptchaSiteKey && recaptchaRef.current) {
-      try {
-        dbg("recaptcha: executing");
-        const token = await recaptchaRef.current.executeAsync();
-        setRecaptchaToken(token || "");
-        recaptchaRef.current.reset();
-        dbg("recaptcha: token", token ? (token.length + " chars") : "<empty>");
-        if (!token) throw new Error("reCAPTCHA validation failed");
-      } catch (e) {
-        console.error("[RedeemForm] reCAPTCHA error:", e);
-        alert(e?.message || "reCAPTCHA error");
+    try {
+      setUiNotice(null);
+      setBusy(true);
+
+      if (!readProvider) throw new Error("Provider not ready");
+      if (!isConnected || !address) throw new Error("Connect a wallet");
+      if (!tokenIn) throw new Error("Select a token");
+      if (!redeemIn) throw new Error("Select wONE or USDC");
+      if (!amountHuman || Number(amountHuman) <= 0) throw new Error("Enter an amount");
+
+      // reCAPTCHA
+      if (RECAPTCHA_ENABLED && recaptchaSiteKey && recaptchaRef.current) {
+        let tok = null;
+        try {
+          tok = await recaptchaRef.current.executeAsync();
+        } catch {
+          throw new Error("reCAPTCHA timed out. Please try again.");
+        } finally {
+          recaptchaRef.current.reset();
+        }
+        if (!tok) throw new Error("reCAPTCHA validation failed");
+      } else {
+        console.log("[reCAPTCHA] dev bypass token");
+      }
+
+      // amount do token
+      const amountIn = parseUnits(String(amountHuman), selectedDecimals);
+
+      // Guard: saldo
+      if (selectedBalance != null && BigInt(amountIn) > BigInt(selectedBalance)) {
+        throw new Error("Insufficient balance for selected token");
+      }
+
+      // Pré-checagem fresh contra limite (mesma lógica do serviço/LimitChecker)
+      const pre = await preflightAmountAgainstLimit(readProvider, address, tokenIn, amountHuman, selectedDecimals);
+      // Atualiza preview com leitura fresh
+      if (pre?.amountUSD18 != null) setAmountUSD18(pre.amountUSD18);
+      if (pre?.remainingUSD18 != null) setLimitUSD18(pre.remainingUSD18);
+
+      if (!pre.ok || (pre.amountUSD18 ?? 0n) >= (pre.remainingUSD18 ?? 0n)) {
+        throw new Error("Insufficient remaining daily limit");
+      }
+
+      // Vault address
+      let vaultAddr = vaultService.getVaultAddress?.() || import.meta.env.VITE_VAULT_ADDRESS || "";
+      if (typeof vaultAddr !== "string" || !vaultAddr) throw new Error("Vault address not configured");
+      vaultAddr = ethers.getAddress(vaultAddr);
+
+      // Whitelist
+      if (!wlOk) throw new Error(wlError || "Address not whitelisted");
+      const proof = wlProof || [];
+
+      // Approve se necessário
+      const erc = new ethers.Contract(tokenIn, ERC20_MINI, readProvider);
+      const allowance = await erc.allowance(address, vaultAddr);
+      if (allowance < amountIn) {
+        const signerA = await ctxProvider?.getSigner?.();
+        if (!signerA) throw new Error("Connect a wallet to approve");
+        const txA = await erc.connect(signerA).approve(vaultAddr, amountIn);
+        await txA.wait();
+      }
+
+      // Envio
+      const signer = await ctxProvider?.getSigner?.();
+      if (!signer) throw new Error("Connect a wallet to proceed");
+
+      let lastReason = "";
+      for (const sig of FN_REDEEM_CANDIDATES) {
+        let args;
+        switch (sig) {
+          case "redeem(address,uint256,address,bytes32[])":
+            args = [tokenIn, amountIn, redeemIn, proof];
+            break;
+          case "redeem(address,uint256,address)":
+            args = [tokenIn, amountIn, redeemIn];
+            break;
+          case "redeem(uint256,address)":
+            args = [amountIn, redeemIn];
+            break;
+          default:
+            continue;
+        }
+
+        // simulate-first
+        const sim = await vaultService.preflightRedeem(readProvider, {
+          fn: sig,
+          args,
+          context: { user: address, tokenIn, amountIn, redeemIn, proof },
+        });
+
+        if (!sim.ok) {
+          lastReason = sim.reason || "";
+          console.warn(`[RedeemForm] simulate fail on ${sig}:`, lastReason);
+          continue;
+        }
+
+        // send
+        const sent = await vaultService.submitRedeem(signer, { fn: sig, args });
+        if (!sent.ok) {
+          if (sent.rejected) {
+            setUiNotice({ type: "warning", text: "Transaction rejected by user" });
+            return;
+          }
+          lastReason = sent.reason || "";
+          console.warn(`[RedeemForm] send fail on ${sig}:`, lastReason);
+          continue;
+        }
+
+        setUiNotice({ type: "success", text: `Redeem submitted. Tx: ${sent.tx.hash}` });
+        await sent.tx.wait();
+        setUiNotice({ type: "success", text: "Redeem confirmed." });
+        setAmountHuman("");
+
+        // refresh balances
+        try {
+          if (readProvider && address && supportedTokens.length > 0) {
+            const refreshed = await Promise.all(
+              supportedTokens.map(async (addr) => {
+                try {
+                  const erc2 = new ethers.Contract(addr, ERC20_MINI, readProvider);
+                  const [dec, sym, bal] = await Promise.all([
+                    erc2.decimals(),
+                    erc2.symbol().catch(() => "TOKEN"),
+                    erc2.balanceOf(address).catch(() => 0n),
+                  ]);
+                  return [addr.toLowerCase(), { raw: bal ?? 0n, decimals: Number(dec) || 18, symbol: String(sym || "TOKEN") }];
+                } catch {
+                  return [addr.toLowerCase(), { raw: 0n, decimals: 18, symbol: "TOKEN" }];
+                }
+              })
+            );
+            setBalances(new Map(refreshed));
+          }
+        } catch {}
         return;
       }
-    }
 
-    try {
-      const signer = await ctxProvider?.getSigner?.();
-      dbg("execute: signer present?", !!signer);
-      if (!signer) throw new Error("Connect a wallet to proceed");
-      const res = await execute(signer);
-      dbg("execute: finished", { hasRes: !!res });
+      setUiNotice({ type: "error", text: friendlySimError(lastReason || "Redeem failed") });
     } catch (e) {
-      console.error("[RedeemForm] execute error:", e);
+      console.error("[RedeemForm] onConfirm error:", e);
+      setUiNotice({ type: "error", text: friendlySimError(e?.shortMessage || e?.reason || e?.message || String(e)) });
+    } finally {
+      setBusy(false);
     }
-  }, [execute, ctxProvider, recaptchaSiteKey, canExecute, state, holdInfo]);
+  }, [
+    readProvider,
+    ctxProvider,
+    isConnected,
+    address,
+    tokenIn,
+    redeemIn,
+    amountHuman,
+    recaptchaSiteKey,
+    selectedDecimals,
+    supportedTokens,
+    selectedBalance,
+    wlOk,
+    wlError,
+    wlProof,
+  ]);
 
-  const isBusy = useMemo(() => ["preparing", "approving", "redeeming"].includes(state), [state]);
+  const hasWone = (vaultBalances?.woneBalance ?? 0n) > 0n;
+  const hasUsdc = (vaultBalances?.usdcBalance ?? 0n) > 0n;
+
+  const confirmDisabled = useMemo(() => {
+    if (busy) return true;
+    if (!isConnected || !address || !tokenIn || !redeemIn) return true;
+    if (!amountHuman || Number(amountHuman) <= 0) return true;
+    if (!wlLoading && !wlOk) return true;
+    // usa >= para alinhar com o contrato/rounding
+    if (amountUSD18 !== 0n && limitUSD18 !== 0n && amountUSD18 >= limitUSD18) return true;
+    return false;
+  }, [busy, isConnected, address, tokenIn, redeemIn, amountHuman, wlLoading, wlOk, amountUSD18, limitUSD18]);
+
+  const isLoading = loadingBase || loadingBalances;
+
+  const limitUsdText = useMemo(() => formatUnits(limitUSD18 ?? 0n, 18), [limitUSD18]);
+  const amountUsdText = useMemo(() => formatUnits(amountUSD18 ?? 0n, 18), [amountUSD18]);
 
   return (
-    <div className={styles.card} style={{ padding: 16 }}>
-      <div className={styles.contractFundsHeader}>
+    <div className={styles.contractRedeemCard}>
+      <div className={styles.contractRedeemHeader}>
         <h3 className={styles.h3} style={{ margin: 0 }}>Redeem</h3>
       </div>
 
-      {/* Aviso de HOLD */}
-      {holdInfo.isHold && (
-        <div className={`${styles.alert} ${styles.warning}`}>
-          Round is <strong>On Hold</strong> until {new Date(holdInfo.startTime * 1000).toLocaleString()} UTC.
+      {isLoading && (
+        <div className={`${styles.alert} ${styles.info}`} style={{ marginBottom: 12 }}>
+          Loading vault data{loadingBalances ? " & balances" : ""}…
         </div>
       )}
 
-      {/* Elegibilidade */}
-      {eligibilityMsg && (
-        <div className={`${styles.alert} ${eligibilityMsg.type === 'success' ? styles.success : styles.warning}`}>
-          {eligibilityMsg.text}
-        </div>
-      )}
-
-      {/* Mensagens locais */}
       {uiNotice && (
-        <div className={`${styles.alert} ${uiNotice.type === 'error' ? styles.error : uiNotice.type === 'warning' ? styles.warning : styles.info}`}>
+        <div
+          className={`${styles.alert} ${
+            uiNotice.type === "error"
+              ? styles.error
+              : uiNotice.type === "warning"
+              ? styles.warning
+              : uiNotice.type === "success"
+              ? styles.success
+              : styles.info
+          }`}
+        >
           {uiNotice.text}
         </div>
       )}
 
-      {/* Campos */}
+      {!wlLoading && !wlOk && (
+        <div className={`${styles.alert} ${styles.warning}`} style={{ marginBottom: 12 }}>
+          {wlError || "Address not whitelisted"}
+        </div>
+      )}
+
+      {(limitUSD18 !== 0n || amountUSD18 !== 0n) && (
+        <div className={styles.card} style={{ marginTop: 8 }}>
+          <div className={styles.contractRedeemRow}>
+            <span className={styles.contractRedeemLabel}>Remaining daily limit</span>
+            <span className={styles.contractRedeemValue}>
+              ${Number(formatUnits(limitUSD18 ?? 0n, 18)).toLocaleString(undefined, { maximumFractionDigits: 6 })}
+            </span>
+          </div>
+          <div className={styles.contractRedeemRow}>
+            <span className={styles.contractRedeemLabel}>This request</span>
+            <span className={styles.contractRedeemValue}>
+              ${Number(formatUnits(amountUSD18 ?? 0n, 18)).toLocaleString(undefined, { maximumFractionDigits: 6 })}
+            </span>
+          </div>
+          {amountUSD18 !== 0n && limitUSD18 !== 0n && amountUSD18 >= limitUSD18 && (
+            <div className={`${styles.alert} ${styles.warning}`} style={{ marginTop: 8 }}>
+              Insufficient remaining daily limit
+            </div>
+          )}
+        </div>
+      )}
+
       <div className={styles.grid2}>
-        {/* Token de Entrada */}
+        {/* Token In */}
         <div className={styles.field}>
           <label className={styles.smallMuted}>Token In</label>
           <TokenSelect
             tokens={supportedTokens}
             value={tokenIn}
-            onChange={setTokenIn}
+            onChange={(v) => {
+              dbg("TokenSelect onChange", v);
+              setTokenIn(v);
+            }}
             placeholder="Select token to redeem"
           />
+          {!!tokenIn && selected && (
+            <div className={styles.smallMuted}>
+              Balance: {formatUnits(selectedBalance, selectedDecimals)} {selectedSymbol}
+            </div>
+          )}
+          {!!fixedPriceText && <div className={styles.smallMuted}>Fixed price (USD): {fixedPriceText}</div>}
         </div>
 
-        {/* Token de Saída (redeemIn) */}
+        {/* Receive In */}
         <div className={styles.field}>
           <label className={styles.smallMuted}>Receive In</label>
-          <select className={styles.select} value={redeemIn} onChange={(e) => setRedeemIn(e.target.value)}>
-            <option value="">— Select —</option>
-            {wone && <option value={wone}>wONE</option>}
-            {usdc && <option value={usdc}>USDC</option>}
-          </select>
+          <div className={styles.row}>
+            {wone && (
+              <button
+                type="button"
+                className={`${styles.button} ${redeemIn === wone ? styles.buttonActive : ""}`}
+                onClick={() => setRedeemIn(wone)}
+                disabled={!hasWone}
+                title={!hasWone ? "Vault has no wONE available" : undefined}
+              >
+                wONE
+              </button>
+            )}
+            {usdc && (
+              <button
+                type="button"
+                className={`${styles.button} ${redeemIn === usdc ? styles.buttonActive : ""}`}
+                onClick={() => setRedeemIn(usdc)}
+                disabled={!hasUsdc}
+                title={!hasUsdc ? "Vault has no USDC available" : undefined}
+              >
+                USDC
+              </button>
+            )}
+            {!hasWone && !hasUsdc && <span className={styles.smallMuted}>Vault has no funds available.</span>}
+          </div>
         </div>
       </div>
 
+      {/* Amount + Max */}
       <div className={styles.field}>
         <label className={styles.smallMuted}>Amount</label>
-        <input
-          className={styles.input}
-          type="number"
-          min={0}
-          step="any"
-          inputMode="decimal"
-          placeholder="e.g. 100"
-          value={amountHuman}
-          onChange={(e) => setAmountHuman(e.target.value)}
-          disabled={isBusy}
-        />
+        <div className={styles.row}>
+          <input
+            className={styles.input}
+            type="number"
+            min={0}
+            step="any"
+            inputMode="decimal"
+            placeholder="e.g. 100"
+            value={amountHuman}
+            onChange={(e) => setAmountHuman(e.target.value)}
+            disabled={busy}
+          />
+          <button
+            type="button"
+            className={styles.button}
+            onClick={onMax}
+            disabled={!isConnected || !address || !tokenIn || busy}
+          >
+            Max
+          </button>
+        </div>
       </div>
 
-      {/* Preview & Status */}
-      {display && (
-        <div className={styles.stackSm}>
-          <div className={styles.contractFundsRow}>
-            <span className={styles.contractFundsLabel}>Status</span>
-            <span className={`${styles.contractFundsPill} ${display.statusCode === 'active' ? styles.statusOpen : display.statusCode === 'hold' ? styles.statusDelay : styles.statusPaused}`}>{display.statusLabel}</span>
-          </div>
-          <div className={styles.contractFundsRow}>
-            <span className={styles.contractFundsLabel}>Fee</span>
-            <span className={styles.contractFundsValue}>{display.feeText}</span>
-          </div>
-          <div className={styles.contractFundsRow}>
-            <span className={styles.contractFundsLabel}>Will Receive</span>
-            <span className={styles.contractFundsValue}>{display.receiveText}</span>
-          </div>
-          <div className={styles.contractFundsRow}>
-            <span className={styles.contractFundsSubLabel}>Limit Before</span>
-            <span className={styles.contractFundsSubValue}>{display.limitBeforeText}</span>
-          </div>
-          <div className={styles.contractFundsRow}>
-            <span className={styles.contractFundsSubLabel}>Limit After</span>
-            <span className={styles.contractFundsSubValue}>{display.limitAfterText}</span>
-          </div>
-        </div>
-      )}
-
-      {/* Razões de bloqueio */}
-      {!!reasons?.length && (
-        <div className={`${styles.alert} ${styles.warning}`}>
-          <strong>Cannot proceed:</strong>
-          <ul style={{ margin: '8px 0 0 16px' }}>
-            {reasons.map((r, i) => (<li key={i}>{r}</li>))}
-          </ul>
-        </div>
-      )}
-
-      {/* Erro do hook */}
-      {hookError && (
-        <div className={`${styles.alert} ${styles.error}`}>{hookError}</div>
-      )}
-
-      {/* Ações */}
-      <div className={styles.row}>
-        <button type="button" className={styles.button} onClick={onPreview} disabled={!canPrepare || isBusy || !user || !tokenIn || !redeemIn || !amountHuman || holdInfo.isHold}>
-          {state === 'preparing' ? 'Checking…' : 'Check'}
-        </button>
-        <button type="button" className={`${styles.button} ${styles.buttonAccent}`} onClick={onConfirm} disabled={!canExecute || isBusy || holdInfo.isHold}>
-          {state === 'approving' ? 'Approving…' : state === 'redeeming' ? 'Redeeming…' : 'Confirm'}
+      {/* Action */}
+      <div className={styles.contractRedeemRow} style={{ marginTop: 12, marginBottom: 12 }}>
+        <button
+          type="button"
+          className={`${styles.button} ${styles.buttonConfirm} ${styles.buttonAccent}`}
+          onClick={onConfirm}
+          disabled={confirmDisabled}
+        >
+          {busy ? "Processing…" : "Confirm"}
         </button>
       </div>
 
-      {/* reCAPTCHA invisível opcional */}
-      {recaptchaSiteKey && (
-        <ReCAPTCHA
-          ref={recaptchaRef}
-          size="invisible"
-          sitekey={recaptchaSiteKey}
-          onChange={(tok) => { setRecaptchaToken(tok || ""); dbg("recaptcha onChange", tok ? (tok.length + " chars") : "<empty>"); }}
-        />
-      )}
-
-      {/* Resultado */}
-      {state === 'success' && (
-        <div className={`${styles.alert} ${styles.success}`}>
-          Redeem submitted successfully.<br/>
-          {receipts?.redeem?.transactionHash && (
-            <span className={styles.smallMuted}>Tx: {receipts.redeem.transactionHash}</span>
-          )}
-        </div>
-      )}
+      {/* Invisible reCAPTCHA */}
+      {RECAPTCHA_ENABLED && recaptchaSiteKey && <ReCAPTCHA ref={recaptchaRef} size="invisible" sitekey={recaptchaSiteKey} />}
     </div>
   );
 }
