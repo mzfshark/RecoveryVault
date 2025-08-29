@@ -1,224 +1,146 @@
-// Recovery Dex — Vault service (ethers v6)
-// All logs/messages in English. Align method names with your ABI if they differ.
+import { Contract, Interface, JsonRpcProvider, getAddress } from "ethers";
+import VaultArtifact from "@/ui/abi/RecoveryVaultABI.json";
+import IWETHABI from "@/ui/abi/IWETH.json";
+import IOracleABI from "@/ui/abi/IOracle.json";
 
-import { ethers } from "ethers";
-import vaultAbi from "../ui/abi/RecoveryVaultABI.json";
+const RPC_URL = import.meta.env.VITE_RPC_URL;
+const CHAIN_ID = Number(import.meta.env.VITE_CHAIN_ID ?? 1666600000);
+const VAULT_ADDRESS = import.meta.env.VITE_VAULT_ADDRESS;
 
-export const ZERO = 0n;
-const ONE_DAY = 24n * 60n * 60n; // fallback if ROUND_DELAY() is unavailable
+const VAULT_ABI = VaultArtifact.abi ?? VaultArtifact;
 
-/** Get default provider (BrowserProvider if window.ethereum exists). */
+function req(v, msg) { if (!v) throw new Error(msg); return v; }
+
 export function getDefaultProvider() {
-  try {
-    if (typeof window !== "undefined" && window.ethereum) {
-      return new ethers.BrowserProvider(window.ethereum);
-    }
-    return null;
-  } catch (err) {
-    console.error("[vaultService] getDefaultProvider error:", err);
-    return null;
-  }
+  req(RPC_URL, "[vaultService] VITE_RPC_URL is missing");
+  return new JsonRpcProvider(RPC_URL);
 }
 
-/** Returns RecoveryVault address from env. */
 export function getVaultAddress() {
-  const addr = import.meta.env.VITE_VAULT_ADDRESS;
-  if (!addr) throw new Error("VITE_VAULT_ADDRESS is not set");
-  return addr;
+  return req(VAULT_ADDRESS, "[vaultService] VITE_VAULT_ADDRESS is missing");
 }
 
-/** Returns RecoveryVault contract bound to signer/provider. */
-export function getVaultContract(signerOrProvider) {
-  if (!signerOrProvider) throw new Error("signerOrProvider is required");
-  return new ethers.Contract(getVaultAddress(), vaultAbi, signerOrProvider);
+export async function getReadContract(readProvider) {
+  req(readProvider, "[vaultService] readProvider is required");
+  const addr = getVaultAddress();
+  const net = await readProvider.getNetwork();
+  if (Number(net.chainId) !== CHAIN_ID) console.warn(`[vaultService] Unexpected chainId ${net.chainId}; expected ${CHAIN_ID}`);
+  const code = await readProvider.getCode(addr);
+  if (!code || code === "0x") throw new Error(`[vaultService] ${addr} has no bytecode`);
+  return new Contract(addr, VAULT_ABI, readProvider);
 }
 
-/**
- * Read helpers
- */
-export async function getDailyLimit(provider, user) {
-  try {
-    const vault = getVaultContract(provider);
-    const [limit, used] = await Promise.all([
-      (async () => { try { return await vault.dailyLimit(user); } catch {} try { return await vault.dailyLimitUsd(); } catch {} return ZERO; })(),
-      (async () => { try { return await vault.dailyUsed(user); } catch {} return ZERO; })(),
-    ]);
-    return { limit: limit ?? ZERO, used: used ?? ZERO };
-  } catch (err) {
-    console.error("[vaultService] getDailyLimit error:", err);
-    return { limit: ZERO, used: ZERO };
-  }
+export async function getWriteContract(signer) {
+  req(signer, "[vaultService] signer is required");
+  const addr = getVaultAddress();
+  return new Contract(addr, VAULT_ABI, signer);
 }
 
-export async function getFeeTier(provider, user, amount) {
-  try {
-    const vault = getVaultContract(provider);
-    try { return Number(await vault.getFeeBps(user, amount)); } catch {}
-    return 100; // 1% fallback
-  } catch (err) {
-    console.error("[vaultService] getFeeTier error:", err);
-    return 100;
-  }
+function b(v){ return BigInt(v); }
+function n(v){ return Number(v); }
+function bool(v){ return Boolean(v); }
+
+export async function owner(p){ return await (await getReadContract(p)).owner(); }
+export async function oracle(p){ return await (await getReadContract(p)).oracle(); }
+export async function devWallet(p){ return await (await getReadContract(p)).devWallet(); }
+export async function rmcWallet(p){ return await (await getReadContract(p)).rmcWallet(); }
+export async function wONE(p){ return await (await getReadContract(p)).wONE(); }
+export async function usdc(p){ return await (await getReadContract(p)).usdc(); }
+export async function merkleRoot(p){ return await (await getReadContract(p)).merkleRoot(); }
+export async function ROUND_DELAY(p){ return b(await (await getReadContract(p)).ROUND_DELAY()); }
+export async function WALLET_RESET_INTERVAL(p){ return b(await (await getReadContract(p)).WALLET_RESET_INTERVAL()); }
+export async function currentRound(p){ return b(await (await getReadContract(p)).currentRound()); }
+export async function roundStart(p){ return b(await (await getReadContract(p)).roundStart()); }
+export async function dailyLimitUsd(p){ return b(await (await getReadContract(p)).dailyLimitUsd()); }
+export async function isLocked(p){ return bool(await (await getReadContract(p)).isLocked()); }
+export async function fixedUsdPrice(p, token){ return b(await (await getReadContract(p)).fixedUsdPrice(token)); }
+export async function lastRedeemTimestamp(p, wallet){ return b(await (await getReadContract(p)).lastRedeemTimestamp(wallet)); }
+export async function supportedToken(p, token){ return bool(await (await getReadContract(p)).supportedToken(token)); }
+export async function supportedTokenList(p, i){ return await (await getReadContract(p)).supportedTokenList(i); }
+export async function feeThresholds(p, i){ return b(await (await getReadContract(p)).feeThresholds(i)); }
+export async function feeBps(p, i){ return Number(await (await getReadContract(p)).feeBps(i)); }
+export async function redeemedInRound(p, roundId, wallet){ return b(await (await getReadContract(p)).redeemedInRound(roundId, wallet)); }
+
+export async function getFeeTiers(p){
+  const v = await getReadContract(p);
+  const r = await v.getFeeTiers();
+  return { thresholds: r[0].map(b), bpsOut: r[1].map(n) };
 }
 
-export async function fetchMerkleProof(user) {
-  try {
-    // TODO: replace with real API when available
-    return [];
-  } catch (err) {
-    console.error("[vaultService] fetchMerkleProof error:", err);
-    return [];
-  }
+export async function getSupportedTokens(p){ return await (await getReadContract(p)).getSupportedTokens(); }
+export async function getUserLimit(p, wallet){ const r = await (await getReadContract(p)).getUserLimit(wallet); return { remainingUSD: b(r) }; }
+export async function getVaultBalances(p){ const r = await (await getReadContract(p)).getVaultBalances(); return { woneBalance: b(r[0]), usdcBalance: b(r[1]) }; }
+export async function getLastRedeemTimestamp(p, user){ return b(await (await getReadContract(p)).getLastRedeemTimestamp(user)); }
+export async function getRoundInfo(p){ const r = await (await getReadContract(p)).getRoundInfo(); return { roundId: b(r[0]), startTime: b(r[1]), isActive: bool(r[2]), paused: bool(r[3]), limitUsd: b(r[4]) }; }
+
+export async function quoteRedeem(p, user, tokenIn, amountIn, redeemIn, proof = []){
+  const v = await getReadContract(p);
+  const r = await v.quoteRedeem(user, tokenIn, amountIn, redeemIn, proof ?? []);
+  return { whitelisted: bool(r[0]), roundIsActive: bool(r[1]), feeAmount: b(r[2]), refundAmount: b(r[3]), userLimitUsdBefore: b(r[4]), userLimitUsdAfter: b(r[5]), usdValue: b(r[6]), tokenInDecimals: n(r[7]), redeemInDecimals: n(r[8]), oraclePrice: b(r[9]), oracleDecimals: n(r[10]) };
 }
 
-export async function quoteRedeem(provider, tokenIn, amount, preferUSDC = true) {
-  try {
-    const vault = getVaultContract(provider);
-    const result = await vault.quoteRedeem(tokenIn, amount, preferUSDC);
-    if (Array.isArray(result)) {
-      const [outAmount, isUSDC] = result;
-      return { outAmount: outAmount ?? ZERO, isUSDC: Boolean(isUSDC) };
-    }
-    if (typeof result === "object" && result) {
-      const outAmount = result.outAmount ?? result[0] ?? ZERO;
-      const isUSDC = result.isUSDC ?? result[1] ?? preferUSDC;
-      return { outAmount, isUSDC: Boolean(isUSDC) };
-    }
-    return { outAmount: ZERO, isUSDC: preferUSDC };
-  } catch (err) {
-    console.error("[vaultService] quoteRedeem error:", err);
-    return { outAmount: ZERO, isUSDC: preferUSDC };
-  }
+export async function redeem(signer, tokenIn, amountIn, redeemIn, proof = [], overrides = {}){
+  const v = await getWriteContract(signer);
+  if (!Array.isArray(proof)) proof = [];
+  return await v.redeem(tokenIn, amountIn, redeemIn, proof, { ...overrides });
 }
 
-/**
- * Execute redemption. Wrapper that tries common signatures:
- *  - redeem(token, amount, merkleProof)
- *  - redeem(token, amount, receiver, receiveOne, merkleProof)
- *  - redeemWithProof(token, amount, merkleProof)
- * Returns { hash } or null.
- */
-export async function redeem(tokenAddress, amount, merkleProof = [], signerOrProvider) {
-  try {
-    // Resolve signer
-    let provider = signerOrProvider;
-    if (!provider) provider = getDefaultProvider();
-    if (!provider) throw new Error("No provider available");
-    const signer = provider.getSigner ? await provider.getSigner() : provider;
+export async function setDailyLimit(signer, usdAmount){ return await (await getWriteContract(signer)).setDailyLimit(usdAmount); }
+export async function setDevWallet(signer, wallet){ return await (await getWriteContract(signer)).setDevWallet(wallet); }
+export async function setFeeTiers(signer, thresholds, bps){ return await (await getWriteContract(signer)).setFeeTiers(thresholds, bps); }
+export async function setFixedUsdPrice(signer, token, usdPrice18){ return await (await getWriteContract(signer)).setFixedUsdPrice(token, usdPrice18); }
+export async function setLocked(signer, status){ return await (await getWriteContract(signer)).setLocked(status); }
+export async function setMerkleRoot(signer, root){ return await (await getWriteContract(signer)).setMerkleRoot(root); }
+export async function setOracle(signer, addr){ return await (await getWriteContract(signer)).setOracle(addr); }
+export async function setRmcWallet(signer, wallet){ return await (await getWriteContract(signer)).setRmcWallet(wallet); }
+export async function setSupportedToken(signer, token, allowed){ return await (await getWriteContract(signer)).setSupportedToken(token, allowed); }
+export async function startNewRound(signer, roundId){ return await (await getWriteContract(signer)).startNewRound(roundId); }
+export async function transferOwnership(signer, newOwner){ return await (await getWriteContract(signer)).transferOwnership(newOwner); }
+export async function withdrawFunds(signer, token){ return await (await getWriteContract(signer)).withdrawFunds(token); }
+export async function renounceOwnership(signer){ return await (await getWriteContract(signer)).renounceOwnership(); }
 
-    const vault = getVaultContract(signer);
-    let tx;
-
-    if (typeof vault.redeem === "function") {
-      // Try simple 3-arg first
-      try {
-        tx = await vault.redeem(tokenAddress, amount, merkleProof);
-      } catch (e1) {
-        // Try extended signature with receiver + flag
-        try {
-          const to = await signer.getAddress();
-          tx = await vault.redeem(tokenAddress, amount, to, false, merkleProof);
-        } catch (e2) {
-          throw e2;
-        }
-      }
-    } else if (typeof vault.redeemWithProof === "function") {
-      tx = await vault.redeemWithProof(tokenAddress, amount, merkleProof);
-    } else {
-      throw new Error("Redeem function not found in ABI");
-    }
-
-    console.info("[vaultService] redeem submitted:", tx.hash);
-    const receipt = await tx.wait();
-    console.info("[vaultService] redeem confirmed in block:", receipt.blockNumber);
-    return { hash: tx.hash };
-  } catch (err) {
-    console.error("[vaultService] redeem error:", err);
-    return null;
-  }
+export async function oracleLatest(p){
+  const o = await oracle(p);
+  const c = new Contract(o, IOracleABI.abi ?? IOracleABI, p);
+  const r = await c.latestPrice();
+  return { price: BigInt(r[0]), decimals: Number(r[1]) };
 }
 
-/** Subscribe to on-chain events. Returns an unsubscribe fn. */
-export function watchEvents(cb = {}, provider) {
-  let prov = provider || getDefaultProvider();
-  if (!prov) {
-    console.error("[vaultService] watchEvents: provider not available");
-    return () => {};
-  }
-  const contract = getVaultContract(prov);
-  const off = [];
-  try {
-    if (cb.onBurnToken) {
-      const h = (...args) => cb.onBurnToken?.(normalizeEvent(args));
-      contract.on("BurnToken", h);
-      off.push(() => contract.off("BurnToken", h));
-    }
-    if (cb.onRedeemProcessed) {
-      const h = (...args) => cb.onRedeemProcessed?.(normalizeEvent(args));
-      contract.on("RedeemProcessed", h);
-      off.push(() => contract.off("RedeemProcessed", h));
-    }
-    if (cb.onNewRoundStarted) {
-      const h = (...args) => cb.onNewRoundStarted?.(normalizeEvent(args));
-      contract.on("NewRoundStarted", h);
-      off.push(() => contract.off("NewRoundStarted", h));
-    }
-  } catch (err) {
-    console.error("[vaultService] watchEvents error:", err);
-  }
-  return () => { off.forEach((fn) => { try { fn(); } catch {} }); };
+export async function wrapNativeToWONE(signer, amount){
+  const provider = signer.provider;
+  const v = await getReadContract(provider);
+  const w = await v.wONE();
+  const c = new Contract(w, IWETHABI.abi ?? IWETHABI, signer);
+  return await c.deposit({ value: amount });
 }
 
-function normalizeEvent(args) {
-  const evt = args?.[args.length - 1];
-  const data = Array.isArray(args) ? args.slice(0, -1) : [];
+export function getEventTopics(){
+  const iface = new Interface(VAULT_ABI);
   return {
-    data,
-    txHash: evt?.log?.transactionHash || evt?.transactionHash,
-    blockNumber: evt?.log?.blockNumber || evt?.blockNumber,
-    log: evt,
+    BurnToken: iface.getEventTopic("BurnToken"),
+    NewRoundStarted: iface.getEventTopic("NewRoundStarted"),
+    RedeemProcessed: iface.getEventTopic("RedeemProcessed"),
+    SupportedTokenUpdated: iface.getEventTopic("SupportedTokenUpdated"),
+    FeeTiersUpdated: iface.getEventTopic("FeeTiersUpdated"),
+    VaultPaused: iface.getEventTopic("VaultPaused"),
+    OwnershipTransferred: iface.getEventTopic("OwnershipTransferred"),
   };
 }
 
-/** Utilities */
-export function parseUnitsSafe(value, decimals = 18) {
+export function normalizeAddress(addr){ try { return getAddress(addr); } catch { return null; } }
+
+export async function isTokenSupported(p, token){
+  const t = normalizeAddress(token);
+  if (!t) return false;
   try {
-    return ethers.parseUnits(String(value ?? "0"), decimals);
-  } catch (err) {
-    console.error("[vaultService] parseUnitsSafe error:", err);
-    return 0n;
-  }
-}
-
-export function formatUnitsSafe(value, decimals = 18) {
+    const ok = await supportedToken(p, t);
+    if (typeof ok === "boolean") return ok;
+  } catch {}
   try {
-    return ethers.formatUnits(value ?? 0n, decimals);
-  } catch (err) {
-    console.error("[vaultService] formatUnitsSafe error:", err);
-    return "0";
-  }
-}
-
-/** High-level vault status */
-export async function getVaultStatus(provider) {
-  try {
-    const vault = getVaultContract(provider);
-    const [paused, locked, roundStart, roundFunds, roundDelay] = await Promise.all([
-      (async () => { try { return Boolean(await vault.paused()); } catch { return false; } })(),
-      (async () => { try { return Boolean(await vault.isLocked()); } catch { return false; } })(),
-      (async () => { try { return await vault.roundStart(); } catch { return 0n; } })(),
-      (async () => { try { return await vault.roundFunds(); } catch { return 0n; } })(),
-      (async () => { try { return await vault.ROUND_DELAY(); } catch { return ONE_DAY; } })(),
-    ]);
-
-    const now = BigInt(Math.floor(Date.now() / 1000));
-    const nextUnlockAt = locked ? roundStart : 0n;
-    const roundActive = Boolean(!paused && !locked && now >= roundStart && roundFunds > 0n);
-    const roundEnd = 0n; // not exposed
-
-    return { paused, locked, roundActive, nextUnlockAt, roundStart, roundEnd, roundFunds, roundDelay };
-  } catch (err) {
-    console.error("[vaultService] getVaultStatus error:", err);
-    return { paused: false, locked: false, roundActive: false, nextUnlockAt: 0n, roundStart: 0n, roundEnd: 0n, roundFunds: 0n, roundDelay: ONE_DAY };
+    const list = await getSupportedTokens(p);
+    const set = new Set(list.map(normalizeAddress).filter(Boolean));
+    return set.has(t);
+  } catch {
+    return false;
   }
 }
