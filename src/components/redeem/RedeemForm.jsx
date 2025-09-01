@@ -835,7 +835,7 @@ export default function RedeemForm({ address: addressProp, debounceMs }) {
           )}
         </div>
       )}
-      {RECAPTCHA_ENABLED && recaptchaSiteKey && <ReCAPTCHA ref={recaptchaRef} sitekey={recaptchaSiteKey} />}
+      {RECAPTCHA_ENABLED && recaptchaSiteKey && <ReCAPTCHA ref={recaptchaRef} size="invisible" sitekey={recaptchaSiteKey} />}
     </div>
   );
 }
