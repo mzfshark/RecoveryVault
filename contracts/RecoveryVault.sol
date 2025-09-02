@@ -19,6 +19,11 @@ interface IWETH {
     function deposit() external payable;
 }
 
+/// @dev Optional burnable interface. Many tokens expose `burn(uint256)` on holder balance.
+interface IERC20Burnable {
+    function burn(uint256 value) external;
+}
+
 contract RecoveryVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -31,25 +36,37 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
     event VaultPaused(bool isPaused);
     event SupportedTokenUpdated(address token, bool allowed);
     event FeeTiersUpdated(uint256[] thresholds, uint16[] bps);
+    event RoundFeeLocked(uint256 indexed roundId, uint16 bps, uint256 basisUsd);
+    event RoundDelayToggled(bool enabled);
 
     // =====================
     // ===== Constants =====
     // =====================
     uint256 public constant ROUND_DELAY = 24 hours;
     uint256 public constant WALLET_RESET_INTERVAL = 24 hours;
+    address public constant DEAD_BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD; // sink address
 
     // =====================
     // =====  Storage  =====
     // =====================
     address public immutable wONE;
     address public immutable usdc;
+    uint8 public immutable WONE_DECIMALS;
+    uint8 public immutable USDC_DECIMALS;
+
     address public devWallet;
-    address public rmcWallet;
+    address public rmcWallet; // kept for withdrawals / ops, not used for burning anymore
     bytes32 public merkleRoot;
     uint256 public currentRound;
     uint256 public roundStart;
     uint256 public dailyLimitUsd; // whole USD (no decimals)
     bool public isLocked;
+
+    // Round config
+    bool public roundDelayEnabled = true; // owner can toggle
+    uint16 public roundBps;              // fixed fee for current round
+    bool public roundFeeLocked;          // true after startNewRound sets roundBps
+    uint256 public roundFeeBasisUsd;     // USD (integer) basis used to pick the tier at round start
 
     IOracle public oracle;
 
@@ -58,7 +75,9 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
 
     // Usage per user per round, in whole USD
     mapping(uint256 => mapping(address => uint256)) public redeemedInRound;
-    mapping(address => uint256) public lastRedeemTimestamp;
+    mapping(address => uint256) public lastRedeemTimestamp; // informational only
+    mapping(address => uint256) public limitUnlockAt;       // if > now, wallet is locked at daily limit
+    mapping(address => uint256) public periodStart;         // anchor for rolling 24h window
 
     // Fixed price table for supported tokens other than wONE/USDC. Scale: 1e18 (USD * 1e18 per whole token)
     mapping(address => uint256) public fixedUsdPrice;
@@ -76,6 +95,8 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
     }
 
     modifier roundActive() {
+        // Prevent pre-round usage when roundStart == 0
+        require(currentRound > 0, "Round not initialized");
         require(!isLocked, "Contract is locked");
         require(block.timestamp >= roundStart, "Round not started");
         (uint256 w, uint256 u) = getVaultBalances();
@@ -104,6 +125,10 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         dailyLimitUsd = _dailyLimitUsd; // whole USD
         oracle = IOracle(_oracle);
 
+        // cache decimals as immutables for gas
+        WONE_DECIMALS = IERC20Metadata(_wone).decimals();
+        USDC_DECIMALS = IERC20Metadata(_usdc).decimals();
+
         for (uint i = 0; i < _supportedTokens.length; i++) {
             supportedToken[_supportedTokens[i]] = true;
             supportedTokenList.push(_supportedTokens[i]);
@@ -120,49 +145,82 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         address redeemIn,
         bytes32[] calldata proof
     ) external payable nonReentrant roundActive onlyWhitelisted(proof) {
-        address resolvedTokenIn = tokenIn;
+        // Derive resolved token **without** moving funds yet
+        address resolvedTokenIn = (tokenIn == address(0)) ? wONE : tokenIn;
 
-        // Accept native ONE -> wrap to wONE
+        // Basic value checks but **defer** transfers/wrap until all validations pass
         if (tokenIn == address(0)) {
             require(msg.value == amountIn, "Mismatch ONE amount");
             require(wONE != address(0), "wONE not configured");
-            IWETH(wONE).deposit{value: amountIn}();
-            resolvedTokenIn = wONE;
         } else {
             require(msg.value == 0, "Do not send ONE with ERC20");
-            IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
         }
 
         // Policy: input must be supported; output must be wONE or USDC
         require(supportedToken[resolvedTokenIn], "Token not supported");
         require(redeemIn == wONE || redeemIn == usdc, "Redeem token must be wONE or USDC");
 
-        // Daily limit checks (based on USD integer of the *input* amount)
-        uint256 usdValueIn = _usdValueFor(resolvedTokenIn, amountIn);
+        // Daily-limit lock guard
+        if (limitUnlockAt[msg.sender] != 0) {
+            require(block.timestamp >= limitUnlockAt[msg.sender], "Daily limit locked");
+        }
+
+        // Reset window if needed; also handle rolling window anchor
         _resetIfNeeded(msg.sender);
+        if (periodStart[msg.sender] == 0) {
+            periodStart[msg.sender] = block.timestamp;
+        }
+
+        // Fetch oracle once for this flow
+        (int256 _p, uint8 _d) = oracle.latestPrice();
+        require(_p > 0, "Invalid oracle");
+        uint256 p = uint256(_p);
+
+        // Determine tokenIn decimals (cache if known)
+        uint8 tokenInDec = resolvedTokenIn == wONE
+            ? WONE_DECIMALS
+            : (resolvedTokenIn == usdc ? USDC_DECIMALS : IERC20Metadata(resolvedTokenIn).decimals());
+
+        // Compute USD usage for this request (USD integer)
+        uint256 usdValueIn = _usdValueForWithDec(resolvedTokenIn, amountIn, tokenInDec, p, _d);
         uint256 usedUsd = redeemedInRound[currentRound][msg.sender];
         uint256 remaining = dailyLimitUsd > usedUsd ? dailyLimitUsd - usedUsd : 0;
         require(usdValueIn <= remaining, "Exceeds daily limit");
-        redeemedInRound[currentRound][msg.sender] = usedUsd + usdValueIn;
 
-        // Fee selection by USD tiers (bps), fee applied in tokenIn units
+        // Fee selection (round-fixed if locked), and net input
         uint256 feeTokenIn = _calculateFee(amountIn, usdValueIn);
         uint256 netIn = amountIn - feeTokenIn;
 
-        // Convert net USD value to redeem token amount
-        uint256 usdValueNet = _usdValueFor(resolvedTokenIn, netIn);
-        uint8 redeemDec = IERC20Metadata(redeemIn).decimals();
-        uint256 priceOut18 = _priceOut18(redeemIn);
-        // amountOut = usdValueNet * 1e18 * 10**redeemDec / priceOut18 (floor)
-        uint256 amountOut = (usdValueNet * 1e18 * (10 ** redeemDec)) / priceOut18;
+        // Quote output amount on **net** value (no state/fund movement yet)
+        uint256 usdValueNet = _usdValueForWithDec(resolvedTokenIn, netIn, tokenInDec, p, _d);
+        uint8 redeemDec = (redeemIn == usdc) ? USDC_DECIMALS : WONE_DECIMALS;
+        uint256 priceOut18 = _priceOut18With(redeemIn, p, _d);
+        uint256 amountOut = (usdValueNet * 1e18 * (10 ** redeemDec)) / priceOut18; // floor
 
         // Liquidity check for redeem token
         require(IERC20(redeemIn).balanceOf(address(this)) >= amountOut, "Insufficient liquidity");
 
-        // Transfers: fee -> dev, net -> rmc (burn/off-ramp), out -> user
+        // === All validations passed — now move funds ===
+        if (tokenIn == address(0)) {
+            IWETH(wONE).deposit{value: amountIn}();
+        } else {
+            IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        }
+
+        // Transfers: fee -> dev, net -> burn/sink, out -> user
         IERC20(resolvedTokenIn).safeTransfer(devWallet, feeTokenIn);
-        IERC20(resolvedTokenIn).safeTransfer(rmcWallet, netIn);
+        _burnOrSink(resolvedTokenIn, netIn);
         IERC20(redeemIn).safeTransfer(msg.sender, amountOut);
+
+        // Update usage & timers only after successful transfers
+        uint256 newUsed = usedUsd + usdValueIn;
+        redeemedInRound[currentRound][msg.sender] = newUsed;
+        if (newUsed == dailyLimitUsd) {
+            // lock lasts until end of the current 24h window
+            uint256 anchor = periodStart[msg.sender] == 0 ? block.timestamp : periodStart[msg.sender];
+            limitUnlockAt[msg.sender] = anchor + WALLET_RESET_INTERVAL;
+        }
+        lastRedeemTimestamp[msg.sender] = block.timestamp;
 
         emit BurnToken(resolvedTokenIn, amountIn, redeemIn, amountOut);
         emit RedeemProcessed(msg.sender, resolvedTokenIn, amountIn, amountOut);
@@ -199,8 +257,11 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         require(supportedToken[tokenIn], "Token not supported");
         require(redeemIn == wONE || redeemIn == usdc, "Redeem token must be wONE or USDC");
 
-        tokenInDecimals = IERC20Metadata(tokenIn).decimals();
-        redeemInDecimals = IERC20Metadata(redeemIn).decimals();
+        // cache decimals without external call when known
+        tokenInDecimals = tokenIn == wONE
+            ? WONE_DECIMALS
+            : (tokenIn == usdc ? USDC_DECIMALS : IERC20Metadata(tokenIn).decimals());
+        redeemInDecimals = (redeemIn == usdc) ? USDC_DECIMALS : WONE_DECIMALS;
 
         (int256 _price, uint8 _decimals) = oracle.latestPrice();
         require(_price > 0, "Invalid oracle");
@@ -208,16 +269,41 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         oracleDecimals = _decimals;
 
         // USD integer valuation for input amount
-        usdValueIn = _usdValueFor(tokenIn, amountIn);
+        usdValueIn = _usdValueForWithDec(tokenIn, amountIn, tokenInDecimals, oraclePrice, oracleDecimals);
 
-        // Daily limit window
+        // Remaining limit computation (non-reverting UI path)
         uint256 redeemed = redeemedInRound[currentRound][user];
-        if (block.timestamp - lastRedeemTimestamp[user] >= WALLET_RESET_INTERVAL) {
+        // apply rolling window if elapsed
+        if (periodStart[user] != 0 && block.timestamp >= periodStart[user] + WALLET_RESET_INTERVAL) {
             redeemed = 0;
         }
-        userLimitUsdBefore = dailyLimitUsd > redeemed ? dailyLimitUsd - redeemed : 0;
-        require(usdValueIn <= userLimitUsdBefore, "Exceeds daily limit");
-        userLimitUsdAfter = userLimitUsdBefore - usdValueIn;
+        uint256 remainingBefore = dailyLimitUsd > redeemed ? dailyLimitUsd - redeemed : 0;
+        bool isTimeLocked = (limitUnlockAt[user] != 0 && block.timestamp < limitUnlockAt[user]);
+
+        if (isTimeLocked || usdValueIn > remainingBefore) {
+            userLimitUsdBefore = 0;
+            userLimitUsdAfter = 0;
+            feeAmountInTokenIn = 0;
+            burnAmountInTokenIn = 0;
+            amountOutRedeemToken = 0;
+            return (
+                whitelisted,
+                roundIsActive,
+                feeAmountInTokenIn,
+                burnAmountInTokenIn,
+                userLimitUsdBefore,
+                userLimitUsdAfter,
+                usdValueIn,
+                tokenInDecimals,
+                redeemInDecimals,
+                oraclePrice,
+                oracleDecimals,
+                amountOutRedeemToken
+            );
+        }
+
+        userLimitUsdBefore = remainingBefore;
+        userLimitUsdAfter = remainingBefore - usdValueIn;
 
         // Fee and net input (tokenIn units)
         uint256 fee = _calculateFee(amountIn, usdValueIn);
@@ -225,8 +311,8 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         burnAmountInTokenIn = amountIn - fee;
 
         // Compute amountOut in redeem token based on net USD
-        uint256 usdValueNet = _usdValueFor(tokenIn, burnAmountInTokenIn);
-        uint256 priceOut18 = _priceOut18(redeemIn);
+        uint256 usdValueNet = _usdValueForWithDec(tokenIn, burnAmountInTokenIn, tokenInDecimals, oraclePrice, oracleDecimals);
+        uint256 priceOut18 = _priceOut18With(redeemIn, oraclePrice, oracleDecimals);
         amountOutRedeemToken = (usdValueNet * 1e18 * (10 ** redeemInDecimals)) / priceOut18;
     }
 
@@ -234,8 +320,11 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
     // ======  Views  ======
     // =====================
     function getUserLimit(address wallet) external view returns (uint256 remainingUSD) {
+        if (limitUnlockAt[wallet] != 0 && block.timestamp < limitUnlockAt[wallet]) {
+            return 0;
+        }
         uint256 redeemed = redeemedInRound[currentRound][wallet];
-        if (block.timestamp - lastRedeemTimestamp[wallet] >= WALLET_RESET_INTERVAL) {
+        if (periodStart[wallet] != 0 && block.timestamp >= periodStart[wallet] + WALLET_RESET_INTERVAL) {
             redeemed = 0;
         }
         remainingUSD = dailyLimitUsd > redeemed ? dailyLimitUsd - redeemed : 0;
@@ -251,7 +340,10 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         uint256 startTime,
         bool isActive,
         bool paused,
-        uint256 limitUsd
+        uint256 limitUsd,
+        bool delayEnabled,
+        uint16 roundFeeBps,
+        uint256 roundFeeBasis
     ) {
         (uint256 w, uint256 u) = getVaultBalances();
         return (
@@ -259,7 +351,10 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
             roundStart,
             !isLocked && block.timestamp >= roundStart && (w > 0 || u > 0),
             isLocked,
-            dailyLimitUsd
+            dailyLimitUsd,
+            roundDelayEnabled,
+            roundBps,
+            roundFeeBasisUsd
         );
     }
 
@@ -330,6 +425,11 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         fixedUsdPrice[token] = usdPrice18; // 1e18 = $1.00
     }
 
+    function setRoundDelayEnabled(bool enabled) external onlyOwner {
+        roundDelayEnabled = enabled;
+        emit RoundDelayToggled(enabled);
+    }
+
     function withdrawFunds(address token) external onlyOwner {
         require(token == wONE || token == usdc, "Token not allowed");
         uint256 balance = IERC20(token).balanceOf(address(this));
@@ -342,50 +442,65 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
         (uint256 w, uint256 u) = getVaultBalances();
         require(w > 0 || u > 0, "No funds");
         currentRound = _roundId;
-        roundStart = block.timestamp + ROUND_DELAY;
+        roundStart = block.timestamp + (roundDelayEnabled ? ROUND_DELAY : 0);
+
+        // Lock a single fee tier for the whole round, based on current vault USD value
+        (int256 _p, uint8 _d) = oracle.latestPrice();
+        require(_p > 0, "Invalid oracle");
+        uint256 p = uint256(_p);
+        uint256 basisUsd = _usdValueForWithDec(wONE, w, WONE_DECIMALS, p, _d)
+            + _usdValueForWithDec(usdc, u, USDC_DECIMALS, p, _d);
+        roundBps = _selectBpsByUsd(basisUsd);
+        roundFeeBasisUsd = basisUsd;
+        roundFeeLocked = true;
+
+        emit RoundFeeLocked(_roundId, roundBps, basisUsd);
         emit NewRoundStarted(_roundId, w, u, roundStart);
     }
 
     // =====================
     // ===== Internals =====
     // =====================
-    function _calculateFee(uint256 amountIn, uint256 usdValue) internal view returns (uint256) {
-        for (uint i = 0; i < feeThresholds.length; i++) {
-            if (usdValue <= feeThresholds[i]) {
-                return (amountIn * feeBps[i]) / 10_000;
-            }
-        }
-        return (amountIn * feeBps[feeBps.length - 1]) / 10_000; // fallback tier
+    function _calculateFee(uint256 amountIn, uint256 usdValueIn) internal view returns (uint256) {
+        uint16 bps = roundFeeLocked ? roundBps : _selectBpsByUsd(usdValueIn);
+        return (amountIn * bps) / 10_000;
     }
 
-    function _usdValueFor(address token, uint256 amount) internal view returns (uint256 usdInt) {
+    function _selectBpsByUsd(uint256 usdValue) internal view returns (uint16) {
+        for (uint i = 0; i < feeThresholds.length; i++) {
+            if (usdValue <= feeThresholds[i]) {
+                return feeBps[i];
+            }
+        }
+        return feeBps[feeBps.length - 1];
+    }
+
+    /// @dev USD integer (floor) for `amount` of `token`, using provided decimals and oracle price.
+    function _usdValueForWithDec(
+        address token,
+        uint256 amount,
+        uint8 tokenDecimals,
+        uint256 oraclePrice,
+        uint8 oracleDecimals
+    ) internal view returns (uint256 usdInt) {
         if (token == wONE) {
-            uint8 dec = IERC20Metadata(token).decimals();
-            (int256 _p, uint8 _d) = oracle.latestPrice();
-            require(_p > 0, "Invalid oracle");
-            uint256 p = uint256(_p);
-            // amount -> 1e18 base, then multiply by USD/ONE price and scale back to integer USD
-            uint256 one18 = amount * 1e18 / (10 ** dec);
-            usdInt = (one18 * p) / (10 ** _d) / 1e18;
+            uint256 one18 = amount * 1e18 / (10 ** tokenDecimals);
+            usdInt = (one18 * oraclePrice) / (10 ** oracleDecimals) / 1e18;
         } else if (token == usdc) {
-            uint8 usdcDec = IERC20Metadata(usdc).decimals();
-            usdInt = amount / (10 ** usdcDec);
+            usdInt = amount / (10 ** tokenDecimals); // 1 USD per USDC
         } else if (fixedUsdPrice[token] > 0) {
-            uint8 dec = IERC20Metadata(token).decimals();
-            usdInt = (amount * fixedUsdPrice[token]) / (10 ** dec) / 1e18;
+            usdInt = (amount * fixedUsdPrice[token]) / (10 ** tokenDecimals) / 1e18;
         } else {
             revert("Unsupported valuation");
         }
     }
 
-    function _priceOut18(address token) internal view returns (uint256 price18) {
+    /// @dev Price in 1e18 scale for redeem token using provided oracle price/decimals.
+    function _priceOut18With(address token, uint256 oraclePrice, uint8 oracleDecimals) internal view returns (uint256 price18) {
         if (token == usdc) {
             return 1e18; // 1 USD per USDC
         } else if (token == wONE) {
-            (int256 _p, uint8 _d) = oracle.latestPrice();
-            require(_p > 0, "Invalid oracle");
-            // price18 = oraclePrice * 1e18 / 10**oracleDecimals
-            return uint256(_p) * 1e18 / (10 ** _d);
+            return oraclePrice * 1e18 / (10 ** oracleDecimals);
         } else {
             revert("Unsupported redeem token");
         }
@@ -396,9 +511,26 @@ contract RecoveryVault is Ownable, ReentrancyGuard {
     }
 
     function _resetIfNeeded(address user) internal {
-        if (block.timestamp - lastRedeemTimestamp[user] >= WALLET_RESET_INTERVAL) {
+        // 1) If a time-lock is set and elapsed, clear lock and usage
+        if (limitUnlockAt[user] != 0 && block.timestamp >= limitUnlockAt[user]) {
             redeemedInRound[currentRound][user] = 0;
+            limitUnlockAt[user] = 0;
+            periodStart[user] = 0;
+            return;
         }
-        lastRedeemTimestamp[user] = block.timestamp;
+        // 2) Rolling 24h window: if window elapsed, reset usage and anchor
+        if (periodStart[user] != 0 && block.timestamp >= periodStart[user] + WALLET_RESET_INTERVAL) {
+            redeemedInRound[currentRound][user] = 0;
+            periodStart[user] = 0;
+        }
+    }
+
+    function _burnOrSink(address token, uint256 amount) internal {
+        if (amount == 0) return;
+        // try burn(uint256) if available
+        (bool ok, ) = token.call(abi.encodeWithSignature("burn(uint256)", amount));
+        if (ok) return;
+        // fallback: send to a well-known burn sink (cannot transfer to address(0) on standard ERC20)
+        IERC20(token).safeTransfer(DEAD_BURN_ADDRESS, amount);
     }
 }
