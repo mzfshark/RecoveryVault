@@ -13,4 +13,4 @@ hardhat.config.js
 vite.config.js
 vitest.config.js
 dist
-public/data
+public/data/*.txt
