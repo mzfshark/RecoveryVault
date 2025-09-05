@@ -1,5 +1,5 @@
 // src/services/vaultCore.js
-import { Contract, JsonRpcProvider, Interface, getAddress } from "ethers";
+import { Contract, JsonRpcProvider, Interface, getAddress, ethers } from "ethers";
 import VaultArtifact from "@/ui/abi/RecoveryVaultABI.json";
 
 const VAULT_ABI = VaultArtifact.abi ?? VaultArtifact;
@@ -35,14 +35,13 @@ function b(v){ return BigInt(v); }
 function n(v){ return Number(v); }
 function bool(v){ return Boolean(v); }
 
+let _read;
 export function getDefaultProvider() {
-  try {
-    const url = import.meta.env.VITE_RPC_URL;
-    if (!url) return undefined;
-    return new JsonRpcProvider(url);
-  } catch {
-    return undefined;
-  }
+  if (_read) return _read;
+  const url = import.meta.env.VITE_RPC_URL;          // ex.: https://api.harmony.one
+  const chainId = Number(import.meta.env.VITE_CHAIN_ID || 1666600000);
+  _read = new ethers.JsonRpcProvider(url, chainId, { staticNetwork: true });
+  return _read;
 }
 
 export function getVaultAddress() {
