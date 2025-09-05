@@ -138,7 +138,7 @@ export default function ContractFunds() {
       console.log("[ContractFunds] compute via vaultService");
 
       // Read-only provider for contract reads
-      const provider = ctxProvider || getDefaultProvider();
+      const provider = getDefaultProvider() || ctxProvider;
       if (!provider) throw new Error("No provider available");
 
       // 1) Get current balances and base status
