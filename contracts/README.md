@@ -1,260 +1,306 @@
-# RecoveryVault — Contract Documentation
+# RecoveryVault — Technical Documentation (Public README)
 
-> **Short summary:** Non–1:1 redeem vault. **Input:** any supported ERC‑20 (or native ONE → auto‑wrapped to wONE). **Output:** only **wONE** or **USDC**. The **fee** is taken in the **input token**; the remaining input is **burned**; the user is paid in the chosen output token at a **USD‑based** conversion. All limits and fee thresholds are expressed in **whole USD** (0 decimals).
-
----
-
-## Overview (for non‑technical readers)
-
-> Contract Deployed (test): `0x5833d9F946513804fbD18F82Dc95502E5A45239e`
-
-**What you do:**
-
-* Send a supported token to the vault and choose whether you want to receive **wONE** or **USDC** back.
-
-**What happens behind the scenes:**
-
-1. If you sent native ONE, the contract wraps it to **wONE**.
-2. The contract checks that you are allowed (whitelist), the round is open, and that you still have daily limit left.
-3. A **fee** (percentage) is taken **from your input token**.
-4. The remainder of your input token is **burned** (sent to a burn sink), meaning it leaves circulation.
-5. The vault pays you in **wONE** or **USDC** (you choose) based on a **USD price**.
-
-   * Because your input paid a fee first, your payout is **proportionally smaller**.
-
-**Why burn?**
-
-* Burning the input token removes it from circulation (or sends it to an irrecoverable sink), making the vault act like a one‑way conversion backed by real tokens.
-
-**Limits & Rounds:**
-
-* You have a **daily USD limit**. When you **reach** that limit, a 24‑hour lock starts.
-* Each **round** has **one fixed fee** chosen at round start. It doesn’t change until a new round starts.
-* The owner can toggle a **24‑hour “round delay”** between the moment a round is created and when it starts paying out.
+> **TL;DR for non-technical readers**
+>
+> * You send a **supported token** to the Vault and choose to receive **wONE or USDC**.
+> * A **small fee** is taken from your input token. The rest is **burned** (or sent to a burn sink), and you receive the corresponding amount of wONE/USDC **based on USD prices**.
+> * There’s a **per-wallet daily limit** in USD (with **4 decimals** of precision) and an optional **round delay** (a round is a time window configured by the owner).
+> * You must be **whitelisted**. The app shows a **non-reverting quote** that explains what you’ll get and how much limit you still have.
+> * Everything is protected by **reentrancy guards**, input **validations first, transfers later**, and **oracle checks** for price safety.
 
 ---
 
-## 1) Key Properties
+## Table of Contents
 
-* **Non‑1:1 payout**: Users receive **wONE** or **USDC** regardless of the input token.
-* **Fee in input token**: The fee is always charged in the incoming token.
-* **Burning the input**: After fee, the net input is burned (first trying `burn(uint256)`, otherwise transferred to the universal burn sink `0x000000000000000000000000000000000000dEaD`).
-* **USD integer accounting**: Daily limits and fee tiers are expressed in **whole USD** (no decimals), using floor rounding.
-* **Round‑fixed fee**: One bps value is chosen at the start of the round and remains constant throughout that round.
-* **Round delay toggle**: Owner can enable/disable the 24h start delay.
+1. [Overview](#overview)
+2. [Core Concepts](#core-concepts)
+3. [Lifecycle & Flow](#lifecycle--flow)
+4. [Math, Units & Rounding](#math-units--rounding)
+5. [Public Interface](#public-interface)
 
----
-
-## 2) Valuation & Units
-
-### 2.1 USD Integer (0 decimals)
-
-All consumption and thresholds are tracked in **whole USD**. Floor rounding is applied when converting from token amounts to USD.
-
-### 2.2 Token → USD (\`\_usdValueFor\`)
-
-* **wONE** → via oracle: `price(USD)`, `decimals`.
-
-  * Convert input amount to 18‑decimals, multiply by price, scale down → whole USD (floor).
-* **USDC** → 1 USD per unit (uses token decimals, typically 6): `usd = amount / 10^decimals`.
-* **Other supported tokens** → **fixedUsdPrice\[token]** (scale **1e18**):
-
-  * `usd = (amount * fixedUsdPrice[token]) / 10^tokenDecimals / 1e18` (floor).
-
-### 2.3 USD → Output Token (\`\_priceOut18\`)
-
-* **USDC** → priceOut18 = `1e18`.
-* **wONE** → `priceOut18 = oraclePrice * 1e18 / 10^oracleDecimals`.
-
-### 2.4 Payout Amount
-
-* First, compute net input after fee: `netIn = amountIn − feeTokenIn`.
-* Convert **net** to USD: `usdValueNet`.
-* Output amount:
-
-  ```
-  amountOut = usdValueNet * 1e18 * 10^dec(redeemIn) / priceOut18    // floor
-  ```
-
-Because the fee is taken first in the input token, the final `amountOut` is proportionally smaller (\~fee%) than it would be without fees.
+   * [Events](#events)
+   * [User Functions](#user-functions)
+   * [View Functions](#view-functions)
+   * [Admin Functions](#admin-functions)
+6. [Pricing & Limits](#pricing--limits)
+7. [Security Considerations](#security-considerations)
+8. [Integration Guide (dApp / SDK)](#integration-guide-dapp--sdk)
+9. [Operational Notes](#operational-notes)
+10. [Glossary](#glossary)
 
 ---
 
-## 3) Daily Limit Logic
+## Overview
 
-* **State:** `redeemedInRound[round][user]` (USD integer consumed in the current round), `limitUnlockAt[user]` (timestamp until which the user is locked at the daily limit).
-* **Flow:**
+**RecoveryVault** lets users **redeem** various supported tokens into **wONE or USDC** at a **USD-based rate**:
 
-  1. If `now < limitUnlockAt[user]`, the user is **locked** and cannot redeem (limit is treated as 0).
-  2. On redeem, compute `usdValueIn` and ensure `usdValueIn ≤ remaining`.
-  3. Update `used = used + usdValueIn`. If `used == dailyLimitUsd`, set `limitUnlockAt[user] = now + 24h` (the **lock window starts when the user hits the limit**).
-  4. When `now ≥ limitUnlockAt[user]`, the next interaction resets usage and clears the lock.
+* Input token is **charged a fee** (in tokenIn), the net amount is **burned** (or sent to a sink address), and the user receives the **output token** (wONE/USDC).
+* **Prices**:
 
-> **Note:** The contract does not allow redeem attempts that would exceed the remaining limit. Users either stay below the limit or hit it exactly and trigger the 24h lock.
-
----
-
-## 4) Rounds & Round‑Fixed Fee
-
-* The owner starts a round with `startNewRound(roundId)`.
-* **Delay:** If `roundDelayEnabled` is true (default), the round starts after 24 hours (`ROUND_DELAY`). Otherwise it starts immediately.
-* **Fee locking:** At round start, the contract computes the vault’s USD value (`wONE` via oracle + `USDC`) and selects a **single tier** via `feeThresholds` and `feeBps`. This bps is stored in `roundBps` and used for every redeem in the round.
-* Changing `feeThresholds` mid‑round won’t affect the **current** round’s fixed `roundBps`; it applies to future rounds only.
-
-**Events:**
-
-* `NewRoundStarted(roundId, woneBalance, usdcBalance, startTime)`
-* `RoundFeeLocked(roundId, bps, basisUsd)`
-
-**Status helper:** `getRoundInfo()` returns current round data (including if delay is enabled and which bps is locked).
+  * **ONE** is priced from an **oracle** (USD/ONE with oracle-provided decimals).
+  * **USDC** is treated as \$1.
+  * Other supported tokens can optionally use a **fixed USD price** set by the owner (18-decimals scale).
+* **Per-wallet daily limit** enforced in **USD4** (USD with 4 decimal places).
+* **Rounds**: the owner starts “rounds” and can enable a **24h delay** before a round becomes active. A round also **locks a fee tier** based on the Vault’s USD balance at round start.
+* **Whitelist**: users must provide a valid **Merkle proof**.
+* **User experience**: `quoteRedeem` **never reverts** for normal “not allowed yet” situations; it returns flags and zero values so UIs can explain why a user cannot redeem yet.
 
 ---
 
-## 5) Whitelist
+## Core Concepts
 
-* Users must be included in a Merkle allowlist.
-* The `onlyWhitelisted(proof)` modifier is applied to `redeem`.
-* `quoteRedeem` will revert with `"Exceeds daily limit"` if the wallet is currently locked (so UI behavior matches on‑chain rules).
+* **Supported input tokens**: ERC-20 tokens approved by the owner. Native ONE is supported via **wONE**; when users send native ONE, the contract wraps it **only after all validations pass**.
+* **Output tokens**: **wONE** or **USDC** only.
+* **Fee tiers (bps)**: configurable thresholds in **whole USD units** that select the fee rate. When a round starts, **one fee tier** is **locked** for the entire round.
+* **USD precision**:
 
----
+  * Internal pricing uses **USD18** (USD × 1e18) for precise math.
+  * **Daily limit / usage** uses **USD4** (USD × 1e4) for user-facing budgets with decimal tolerance.
+* **Rolling 24h window**:
 
-## 6) Fees
-
-### 6.1 Tier Selection
-
-* `feeThresholds` (USD integers) and `feeBps` (basis points) define the schedule.
-* Selection is the **first** tier where `usd ≤ threshold`, otherwise the **last bps**.
-* The selected bps is **locked for the entire round** in `roundBps`.
-
-### 6.2 Charging
-
-* Fee is charged **in the input token**.
-* `feeTokenIn = amountIn * roundBps / 10_000`.
-* The fee is transferred to `devWallet`.
+  * Each wallet has an anchor `periodStart`. If **24h elapse**, usage resets.
+  * If the user **hits** the daily limit exactly, the wallet is **locked** until the end of the current 24h window.
 
 ---
 
-## 7) Burn Mechanism
+## Lifecycle & Flow
 
-* After taking the fee, the **net input** is burned:
+### 1) Round set-up (admin)
 
-  1. Try calling `burn(uint256)` on the token (works for standard Burnable tokens).
-  2. If the call fails, transfer to the universal burn sink `0x000000000000000000000000000000000000dEaD`.
+* Admin deposits wONE/USDC into the Vault.
+* Admin calls `startNewRound(roundId)`. If **delay** is enabled, the round starts after `ROUND_DELAY` (24h).
+* The contract reads the oracle, computes the vault’s USD value, **picks and locks a fee tier** (`roundBps`) for this round, and emits `RoundFeeLocked` and `NewRoundStarted`.
 
-> **Why not `address(0)`?** Most ERC‑20 implementations **revert** transfers to `address(0)`. The `0x…dEaD` sink is universally used to remove tokens from circulation.
+### 2) User quote (read-only)
 
----
+* Frontend calls:
 
-## 8) Admin Interface (Owner)
+  * `getUserLimit(user)` → remaining **USD4**.
+  * `quoteRedeem(user, tokenIn, amountIn, redeemIn, proof)` → flags + precise amounts.
+* If conditions aren’t met (e.g., not whitelisted, limit exceeded, round inactive), the function **returns flags and zeros** instead of reverting, so the UI can show “why”.
 
-* **Whitelist root**
+### 3) Redeem (state-changing)
 
-  * `setMerkleRoot(bytes32 root)`
-* **Supported tokens & fixed price**
+* **All validations first**:
 
-  * `setSupportedToken(address token, bool allowed)`
-  * `setFixedUsdPrice(address token, uint256 usdPrice18)` // `1e18 = $1.00`
-* **Fees** (for future rounds)
+  * Whitelist check.
+  * Round active & vault funded.
+  * Token supported / output is wONE or USDC.
+  * Daily limit not time-locked.
+  * USD valuation passes limit check (using USD4).
+  * Fee calculation (bps from locked tier).
+  * Output amount computed and **liquidity** confirmed.
+* **Only then**, funds move:
 
-  * `setFeeTiers(uint256[] thresholdsUsd, uint16[] bps)` // `bps.length == thresholds.length + 1`
-* **Limits & wallets & oracle**
+  * If `tokenIn == address(0)`: assert `msg.value == amountIn`, wrap to wONE.
+  * Else: pull ERC-20 via `safeTransferFrom`.
+* **Post-move**:
 
-  * `setDailyLimit(uint256 usdInteger)`
-  * `setDevWallet(address wallet)`
-  * `setRmcWallet(address wallet)` // kept for withdraws of payout tokens
-  * `setOracle(address oracle)`
-* **Operations**
-
-  * `setLocked(bool)` // global pause/unpause
-  * `setRoundDelayEnabled(bool)` // toggle 24h delay for next `startNewRound`
-  * `startNewRound(uint256 roundId)` // picks and locks `roundBps` for the round
-  * `withdrawFunds(address token)` // only `wONE` or `USDC` (payout liquidity)
-
----
-
-## 9) Public Views & Helpers
-
-* `quoteRedeem(user, tokenIn, amountIn, redeemIn, proof)` → simulation
-
-  * Returns: whitelist/round status, `feeAmountInTokenIn`, `burnAmountInTokenIn`, `userLimitUsdBefore/After`, `usdValueIn`, decimals, oracle data, and `amountOutRedeemToken`.
-* `getUserLimit(address wallet)` → remaining daily USD (0 if locked until `limitUnlockAt`).
-* `getVaultBalances()` → current wONE & USDC balances.
-* `getRoundInfo()` → `(roundId, startTime, isActive, paused, dailyLimitUsd, delayEnabled, roundFeeBps, roundFeeBasisUsd)`.
-* `getSupportedTokens()`, `getFeeTiers()`
-* `getLastRedeemTimestamp(address user)`
+  * Fee → `devWallet`.
+  * Net → `_burnOrSink(tokenIn, netIn)` (try `burn`; fallback to sink).
+  * Output token → user.
+  * Update usage / locks; emit `BurnToken` and `RedeemProcessed`.
 
 ---
 
-## 10) Security Notes
+## Math, Units & Rounding
 
-* `ReentrancyGuard` on state‑changing functions.
-* `SafeERC20` for all token operations.
-* Oracle dependency is **only for wONE**. For every other token, the owner must set a fixed USD price.
-* Burning uses the safest approach available per token.
+* **Oracle**: returns `(price, decimals)` for **USD/ONE**.
+* **Scales**:
 
----
+  * **USD18**: 1.00 USD = `1e18`. Used for calculations (`usdIn18`, `usdNet18`).
+  * **USD4**: 1.0000 USD = `1e4`. Used for **daily limit** configuration and accounting.
+  * **fixedUsdPrice\[token]**: **USD18 per 1 token** (18-decimals).
+* **Rounding**:
 
-## 11) Integration Tips (Frontend / Services)
+  * USD valuations for **policy** (limit/tiers) use **floor** conversion from USD18 → USD4.
+  * Token output is derived from **USD18** math and scaled to token decimals; result is floored by integer division.
+* **Decimals caching**:
 
-* Always call `quoteRedeem` before `redeem` to:
-
-  * Check whitelist/round/lock status and remaining daily limit.
-  * Display the **exact** `amountOut` in the chosen output token.
-  * Show the **fee in input token** and the **net burned amount**.
-* For new tokens, ensure both:
-
-  * `setSupportedToken(token, true)` and `setFixedUsdPrice(token, usdPrice18)` are configured.
-* After `startNewRound`, read `getRoundInfo()` to show the **locked fee** for the round.
+  * `WONE_DECIMALS` and `USDC_DECIMALS` are **immutables** loaded in the constructor to save gas.
 
 ---
 
-## 12) Example Flow
+## Public Interface
 
-1. **User** wants USDC back and sends 10 XYZ tokens (XYZ is supported with fixed price = \$2.00, i.e., `2e18`).
-2. **Valuation**: 10 × \$2.00 = **\$20** (USD integer = 20).
-3. **Daily limit**: remaining ≥ 20 → OK.
-4. **Round fee**: suppose roundBps = 100 (1%). Fee = 0.1 XYZ. Net = 9.9 XYZ.
-5. **Net USD**: 9.9 × \$2.00 = **\$19.8** (USD integer = 19).
-6. **Payout**: redeemIn = USDC, priceOut18 = 1e18. USDC has 6 decimals → `amountOut = 19 × 1e18 × 10^6 / 1e18 = 19e6` (19.000000 USDC).
-7. **Transfers**: 0.1 XYZ → `devWallet`; 9.9 XYZ → burned; 19 USDC → user.
-8. **Usage**: user adds 20 USD to their daily usage.
-9. If the user **hits** the daily limit exactly, they are locked for 24h.
+### Events
 
-> Numbers above illustrate floor rounding at USD integer steps.
-
----
-
-## 13) Testing Checklist
-
-* **ONE native path** (wrap → wONE).
-* **Valuation** across wONE, USDC, and fixed‑price tokens.
-* **Daily limit** accumulation, hitting the limit, lock timing, and automatic reset.
-* **Round fee locking**: fee stays constant during the round despite balance changes.
-* **Burn path**: token with `burn()` and token without (fallback to `0x…dEaD`).
-* **Liquidity checks**: insufficient and sufficient cases for both wONE and USDC payouts.
-* **Whitelist** acceptance/rejection.
-* **Quote vs Redeem parity**: outputs consistent with on‑chain behavior.
+* `BurnToken(address tokenIn, uint256 amountIn, address outputToken, uint256 amountOut)`
+  Emitted on each redeem; `outputToken` is the **redeem token** (wONE/USDC).
+* `RedeemProcessed(address user, address tokenIn, uint256 amountIn, uint256 amountOut)`
+  Convenience event for indexers/analytics.
+* `NewRoundStarted(uint256 roundId, uint256 woneBalance, uint256 usdcBalance, uint256 startTime)`
+* `RoundFeeLocked(uint256 roundId, uint16 bps, uint256 basisUsd)`
+  `basisUsd` is the **whole USD** basis used to select the tier at round start.
+* `VaultPaused(bool isPaused)`
+* `SupportedTokenUpdated(address token, bool allowed)`
+* `FeeTiersUpdated(uint256[] thresholds, uint16[] bps)`
+* `RoundDelayToggled(bool enabled)`
 
 ---
 
-## 14) Changelog Notes (Conceptual)
+### User Functions
 
-* Removed 1:1 constraint; output restricted to wONE/USDC.
-* Fee taken in input token; payout in chosen token via USD conversion of **net**.
-* Net input is burned (try `burn()`, else sink `0x…dEaD`).
-* Daily limit lock starts **when the wallet reaches the limit**; lock lasts 24h.
-* Fee is **locked per round** at `startNewRound`.
-* Round delay (24h) is **toggleable**.
+#### `redeem(address tokenIn, uint256 amountIn, address redeemIn, bytes32[] proof)`
 
----
+Redeems `amountIn` of `tokenIn` into `redeemIn` (**wONE** or **USDC**).
+If `tokenIn == address(0)`, the caller must send `msg.value == amountIn` (native ONE), which is wrapped to wONE **after** validations pass.
 
-## 15) Glossary
+* **Reverts** on:
 
-* **USD integer**: whole‑number US dollars (no cents). All accounting uses floor rounding to the nearest whole USD.
-* **bps**: basis points. 100 bps = 1%.
-* **Burn**: permanently remove tokens from circulation or send to an unrecoverable sink.
-* **wONE**: wrapped ONE (ERC‑20 representation of native ONE).
+  * Not whitelisted / round not active / vault empty.
+  * Input token not supported / invalid output token.
+  * Oracle invalid.
+  * Exceeds daily limit (USD4).
+  * Insufficient output liquidity.
 
 ---
 
-*This document reflects the current contract in the repository (`RecoveryVault.sol`).*
+### View Functions
+
+#### `quoteRedeem(address user, address tokenIn, uint256 amountIn, address redeemIn, bytes32[] proof) → ( … )`
+
+Returns a **non-reverting** quote + status flags:
+
+* `whitelisted` — user is on the Merkle allowlist.
+* `roundIsActive` — current round has started and vault is not locked.
+* `feeAmountInTokenIn` — fee in the input token units.
+* `burnAmountInTokenIn` — net input (what will be burned/sent to sink).
+* `userLimitUsdBefore` / `userLimitUsdAfter` — remaining **USD4** before/after this request (0 if blocked).
+* `usdValueIn` — input **USD** amount used for policy (**USD4**).
+* `tokenInDecimals` / `redeemInDecimals`
+* `oraclePrice` / `oracleDecimals`
+* `amountOutRedeemToken` — output token units to receive.
+
+> If the action is blocked (e.g., over limit, time-locked), the function **returns zeros** for the numeric fields so UIs can display the reason/timer, not a revert.
+
+#### `getUserLimit(address wallet) → uint256 remainingUSD4`
+
+Remaining per-wallet daily limit in **USD4**.
+
+#### `getRoundInfo() → (roundId, startTime, isActive, paused, limitUsd4, delayEnabled, roundFeeBps, roundFeeBasisUsd)`
+
+Round and configuration snapshot. `limitUsd4` is the **daily limit** in **USD4**.
+
+#### Other views
+
+* `getVaultBalances() → (woneBalance, usdcBalance)`
+* `getSupportedTokens() → address[]`
+* `getFeeTiers() → (uint256[] thresholds, uint16[] bps)`
+* `getLastRedeemTimestamp(address user) → uint256`
+
+---
+
+### Admin Functions
+
+* `setMerkleRoot(bytes32 root)`
+* `setSupportedToken(address token, bool allowed)`
+* `setLocked(bool status)` — global pause.
+* `setDailyLimit(uint256 usd4)` — **USD4** (e.g., `$100.1234` → `1_001_234`).
+* `setOracle(address oracle)` — must expose `latestPrice() → (int256 price, uint8 decimals)` for USD/ONE.
+* `setDevWallet(address wallet)`
+* `setRmcWallet(address wallet)`
+* `setFeeTiers(uint256[] thresholdsUSD, uint16[] bps)` — `bps.length = thresholds.length + 1`. Thresholds are **whole USD** (no decimals).
+* `setFixedUsdPrice(address token, uint256 usd18PerToken)` — 18-dec USD per 1 token.
+* `setRoundDelayEnabled(bool enabled)` — toggles 24h round delay.
+* `withdrawFunds(address token)` — only **wONE** or **USDC**.
+* `startNewRound(uint256 roundId)` — `roundId` must strictly increase.
+
+---
+
+## Pricing & Limits
+
+* **ONE**: valued via oracle `(price, decimals)` as **USD/ONE**.
+* **USDC**: `1 USDC = $1`.
+* **Other tokens**: if `fixedUsdPrice[token] > 0`, use that **USD18** price; otherwise the redemption is **unsupported** (reverts).
+* **Fee selection**:
+
+  * If a round is active with a locked fee, use that **roundBps**.
+  * Otherwise, the fee is selected by current **USD4/whole USD** thresholds.
+* **Daily limit**:
+
+  * Configured and accounted in **USD4**.
+  * Enforced on **input USD value** (`usdIn18 → usd4`).
+  * Rolling 24h behavior with **lock** when the limit is exactly reached.
+
+---
+
+## Security Considerations
+
+* **Validation-first** design: all checks (supported token, round state, oracle reading, limit window, fee, liquidity) run **before** any transfer or wrapping. This prevents “funds stuck in vault” on later reverts.
+* **Reentrancy**: `nonReentrant` guard on state-changing `redeem`.
+* **Whitelist**: Merkle proof validated on both `quoteRedeem` (for UX) and `redeem`.
+* **Oracle**: `latestPrice()` must be **positive**; otherwise the call reverts.
+* **Burn or sink**: `_burnOrSink` first attempts `IERC20Burnable(token).burn(amount)` in `try/catch`; if it fails, it safely transfers to a known **burn sink**.
+* **Native ONE**: wrapping only happens **after** validations; `msg.value` must equal `amountIn`.
+* **Owner withdrawals**: restricted to **wONE/USDC** only; no arbitrary tokens.
+* **Cached decimals**: `WONE_DECIMALS` / `USDC_DECIMALS` cached as `immutable` to reduce external calls.
+
+---
+
+## Integration Guide (dApp / SDK)
+
+**Quoting flow (frontend):**
+
+1. Read **supported tokens**, **vault balances**, and **round info**.
+2. Check user **whitelist** (Merkle proof).
+3. Call `getUserLimit(user)` (USD4) for budget display.
+4. Call `quoteRedeem(user, tokenIn, amountIn, redeemIn, proof)`.
+
+   * If blocked: show `roundIsActive`, `whitelisted`, and any time left until unlock.
+   * If allowed: display fee / net / expected output.
+
+**Execution flow:**
+
+1. For ERC-20 inputs: ensure **allowance** for the Vault.
+2. For native ONE inputs: set `tokenIn = address(0)`, send `msg.value = amountIn`.
+3. Call `redeem(tokenIn, amountIn, redeemIn, proof)`.
+
+**Ethers example (ERC-20 input):**
+
+```js
+const v = new ethers.Contract(vaultAddr, VaultABI, signer);
+const proof = [...];                 // Merkle proof bytes32[]
+const tokenIn = SOME_ERC20;
+const amountIn = ethers.parseUnits("123.45", inDecimals);
+const redeemIn = USDC;               // or wONE
+
+// 1) Optional: non-reverting quote
+const q = await v.quoteRedeem(user, tokenIn, amountIn, redeemIn, proof);
+
+// 2) Approve if needed
+await erc20.connect(signer).approve(vaultAddr, amountIn);
+
+// 3) Redeem
+const tx = await v.redeem(tokenIn, amountIn, redeemIn, proof);
+await tx.wait();
+```
+
+**Ethers example (native ONE):**
+
+```js
+const tokenIn = ethers.ZeroAddress;           // native
+const amountIn = ethers.parseEther("50");
+const redeemIn = wONE; // or USDC
+
+const tx = await v.redeem(tokenIn, amountIn, redeemIn, proof, { value: amountIn });
+await tx.wait();
+```
+
+---
+
+## Glossary
+
+* **USD18**: USD value scaled by `1e18`.
+* **USD4**: USD value scaled by `1e4` (four decimals; improves UX tolerance).
+* **Round**: a configured period where a single fee tier is locked and (optionally) starts after a delay.
+* **wONE**: wrapped ONE (ERC-20).
+* **Burn sink**: a known address where tokens are irretrievably sent if `burn()` is not available.
+
+---
+
+**License:** MIT
+
+**Audits:** *Contract verified on explorer and its opensource to be audited by everyONE.*
+
+**Contacts:** *[Mauricio F](https://t.me/mzfshark). | [ Think in Coin](https://t.me/thinkincoin) channel*
